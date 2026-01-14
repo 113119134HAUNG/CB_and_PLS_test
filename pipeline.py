@@ -1,589 +1,326 @@
-# pls_project/pls_core.py
+# pls_project/pipeline.py
 from __future__ import annotations
 
-import sys
-import subprocess
-import warnings
-from typing import Dict, List, Tuple, Optional, Iterable, Any
+import re
+from itertools import groupby
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold
+
+from pls_project.io_utils import to_score, reverse_1to5, get_or_create_ws, write_block
+from pls_project.paper import (
+    reliability_summary,
+    item_analysis_table,
+    one_factor_fa_table,
+    one_factor_efa_table,
+    run_cfa,
+)
+from pls_project.pls_core import (
+    topo_sort,
+    make_plspm_path,
+    htmt_matrix,
+    r2_f2_from_scores,
+    q2_cv_from_scores,
+    structural_vif,
+)
+from pls_project.pls_estimate import estimate_pls_basic_paper
+from pls_project.pls_bootstrap import summarize_direct_ci
 
 
-# =========================================================
-# 0) Graph / path utilities
-# =========================================================
-def topo_sort(nodes: Iterable[str], edges: List[Tuple[str, str]]) -> List[str]:
-    """Topological sort for a DAG; falls back to input order if cycle detected."""
-    nodes = list(nodes)
-    adj = {n: [] for n in nodes}
-    indeg = {n: 0 for n in nodes}
-    for a, b in edges:
-        if a in adj and b in adj:
-            adj[a].append(b)
-            indeg[b] += 1
+def run_pipeline(cog, reverse_target: bool, tag: str):
+    cfg = cog.cfg
+    OUT_XLSX = f"{cfg.io.OUT_XLSX_BASE}_{tag}.xlsx"
+    OUT_CSV  = f"{cfg.io.OUT_CSV_BASE}_{tag}.csv"
 
-    q = [n for n in nodes if indeg[n] == 0]
-    out = []
-    while q:
-        n = q.pop(0)
-        out.append(n)
-        for m in adj[n]:
-            indeg[m] -= 1
-            if indeg[m] == 0:
-                q.append(m)
+    print("\n" + "=" * 80)
+    print(f"🚀 Running scenario: {tag} | reverse_{cfg.scenario.SCENARIO_TARGET}={reverse_target}")
+    print("=" * 80)
 
-    return out if len(out) == len(nodes) else nodes
+    df = pd.read_excel(cfg.io.XLSX_PATH, sheet_name=cfg.io.SHEET_NAME)
+    df.columns = df.columns.astype(str).str.strip()
+    print("Data shape:", df.shape)
 
+    # find item columns
+    SCALES = list(cfg.scales.SCALES)
+    scale_alt = "|".join(SCALES)
+    item_pat = re.compile(rf"^(?:{scale_alt})\d{{1,2}}$")
+    item_cols = [c for c in df.columns if item_pat.fullmatch(str(c))]
 
-def make_plspm_path(nodes_ordered: List[str], edges_from_to: List[Tuple[str, str]]) -> pd.DataFrame:
-    """
-    Build lower-triangular path matrix used by plspm:
-      path.loc[to, from] = 1 if from -> to exists
-    """
-    path = pd.DataFrame(0, index=nodes_ordered, columns=nodes_ordered, dtype=int)
-    for fr, to in edges_from_to:
-        if fr in path.columns and to in path.index:
-            path.loc[to, fr] = 1
+    def sort_key(c):
+        m = re.match(r"^([A-Z]+)(\d+)$", str(c))
+        return (SCALES.index(m.group(1)) if m and m.group(1) in SCALES else 999, int(m.group(2)) if m else 999)
 
-    A = path.values
-    if np.any(np.triu(A, k=0) != 0):
-        bad = np.where(np.triu(A, k=0) != 0)
-        raise ValueError(
-            f"path_matrix not lower triangular. Bad at row={bad[0][0]}, col={bad[1][0]}."
+    item_cols = sorted(item_cols, key=sort_key)
+    if not item_cols:
+        raise ValueError("找不到題項欄位！請確認欄名是否為 PA1/BS1/.../LO6。")
+
+    groups = [g for g in SCALES if any(col.startswith(g) for col in item_cols)]
+    group_items = {g: [c for c in item_cols if c.startswith(g)] for g in groups}
+    print("Groups:", groups)
+
+    # reverse list
+    REVERSE_ITEMS = list(cfg.scales.BASE_REVERSE_ITEMS)
+    if reverse_target and cfg.scenario.SCENARIO_TARGET in group_items:
+        REVERSE_ITEMS += list(group_items[cfg.scenario.SCENARIO_TARGET])
+
+    # flags
+    df["_flag_noexp"] = False
+    df["_flag_dup"] = False
+
+    # experience column
+    EXP_COL = cfg.cols.EXP_COL
+    TS_COL = cfg.cols.TS_COL
+    USER_COL = cfg.cols.USER_COL
+    EMAIL_COL = cfg.cols.EMAIL_COL
+
+    def has_experience(x) -> bool:
+        if pd.isna(x):
+            return False
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            return float(x) > 0
+        s = str(x).strip()
+        no_kw = ["沒有", "否", "不曾", "從未", "未", "無"]
+        yes_kw = ["有", "是", "曾", "使用過"]
+        if any(k in s for k in no_kw):
+            return False
+        if any(k in s for k in yes_kw):
+            return True
+        return False
+
+    if EXP_COL in df.columns:
+        df["_flag_noexp"] = ~df[EXP_COL].apply(has_experience)
+
+    df["_ts"] = pd.to_datetime(df[TS_COL], errors="coerce") if TS_COL in df.columns else pd.NaT
+    df["_orig_order"] = np.arange(len(df))
+
+    dup_key = [c for c in [USER_COL, EMAIL_COL] if c in df.columns]
+    if dup_key:
+        df_sorted = df.sort_values(["_ts", "_orig_order"], na_position="last").copy()
+        df_sorted["_flag_dup"] = df_sorted.duplicated(subset=dup_key, keep=cfg.filt.KEEP_DUP)
+        df = df_sorted.sort_values("_orig_order")
+
+    # likert -> numeric
+    for c in item_cols:
+        df[c] = df[c].apply(to_score).astype(float)
+
+    # reverse items
+    for c in REVERSE_ITEMS:
+        if c in df.columns:
+            df[c] = df[c].apply(reverse_1to5).astype(float)
+
+    # careless flags
+    k_all = len(item_cols)
+    df["_missing_rate"] = df[item_cols].isna().mean(axis=1)
+    df["_sd_items"] = df[item_cols].std(axis=1, ddof=0)
+
+    def max_run_length(arr) -> int:
+        v = [int(x) for x in arr if pd.notna(x)]
+        if len(v) == 0:
+            return 0
+        return max(sum(1 for _ in g) for _, g in groupby(v))
+
+    df["_longstring"] = df[item_cols].apply(lambda r: max_run_length(r.values), axis=1)
+    df["_flag_careless"] = (
+        (df["_missing_rate"] > cfg.filt.MAX_MISSING_RATE) |
+        (df["_sd_items"] <= cfg.filt.MIN_SD_ITEMS) |
+        (df["_longstring"] >= int(np.ceil(cfg.filt.LONGSTRING_PCT * k_all)))
+    )
+
+    # build exclusion reason
+    def join_reasons(r):
+        reasons = []
+        if bool(r.get("_flag_noexp", False)):
+            reasons.append("無GenAI學習經驗")
+        if bool(r.get("_flag_dup", False)):
+            reasons.append("重複填答")
+        if bool(r.get("_flag_careless", False)):
+            reasons.append("疑似隨意/草率(缺漏/直線/長串)")
+        return ";".join(reasons)
+
+    df["_exclude_reason"] = df.apply(join_reasons, axis=1)
+    excluded_df = df[df["_exclude_reason"] != ""].copy()
+    df_valid = df[df["_exclude_reason"] == ""].copy()
+
+    print("🧹 無效問卷剔除完成")
+    print("原始樣本數:", len(df_valid) + len(excluded_df))
+    print("剔除樣本數:", len(excluded_df))
+    print("有效樣本數:", len(df_valid))
+
+    if cfg.io.DROP_EMAIL_IN_VALID_DF and (EMAIL_COL in df_valid.columns):
+        df_valid = df_valid.drop(columns=[EMAIL_COL])
+
+    df_valid = df_valid.drop(columns=[c for c in df_valid.columns if c.startswith("_")], errors="ignore")
+
+    # Paper tables
+    RelTable = reliability_summary(cog, df_valid, groups, group_items, item_cols)
+    ItemTable = item_analysis_table(cog, df_valid, groups, group_items)
+    FA1Table = one_factor_fa_table(cog, df_valid, groups, group_items)
+    EFA1Table, EFA1Fit = one_factor_efa_table(cog, df_valid, groups, group_items)
+
+    # CFA
+    CFA_Loadings, CFA_Info, CFA_Fit = run_cfa(cog, df_valid, groups, group_items, item_cols)
+
+    # ==============================
+    # PLS main (one-shot estimation)
+    # ==============================
+    PLS1_info = PLS1_outer = PLS1_quality = PLS1_htmt = PLS1_cross = pd.DataFrame()
+    PLS2_info = PLS2_outer = PLS2_quality = PLS2_htmt = PLS2_cross = PLS2_commitment = pd.DataFrame()
+    PLS1_R2 = PLS1_f2 = PLS1_Q2 = PLS1_VIF = pd.DataFrame()
+    PLS2_R2 = PLS2_f2 = PLS2_Q2 = PLS2_VIF = pd.DataFrame()
+    PLS1_BOOTPATH = PLS2_BOOTPATH = pd.DataFrame()
+
+    if cfg.pls.RUN_PLS:
+        Xpls = df_valid[item_cols].copy().astype(float)
+
+        # missing handling (config-driven)
+        if cfg.pls.PLS_MISSING == "none":
+            if Xpls.isna().any().any():
+                raise ValueError("PLS_MISSING='none' but missing values exist. Handle missing before import.")
+        elif cfg.pls.PLS_MISSING == "listwise":
+            Xpls = Xpls.dropna()
+        elif cfg.pls.PLS_MISSING == "mean":
+            # 這會生成新值；若你要完全乾淨請改成 none/listwise
+            Xpls = Xpls.apply(lambda s: s.fillna(s.mean()), axis=0)
+        else:
+            raise ValueError(f"Unknown PLS_MISSING: {cfg.pls.PLS_MISSING}")
+
+        Xpls = Xpls.reset_index(drop=True)
+
+        # ---- Model1 ----
+        edges1 = [
+            ("SA", "MIND"), ("SA", "ACO"), ("SA", "CCO"),
+            ("PA", "BB"), ("PA", "BS"),
+            ("BS", "MIND"), ("BS", "ACO"), ("BS", "CCO"), ("BS", "CI"),
+            ("MIND", "CI"), ("BB", "CI"), ("ACO", "CI"), ("CCO", "CI"),
+            ("CI", "LO"),
+        ]
+        lv_set1 = [g for g in ["PA", "SA", "BB", "BS", "MIND", "ACO", "CCO", "CI", "LO"] if g in groups]
+        order1 = topo_sort(lv_set1, edges1)
+        path1 = make_plspm_path(order1, edges1)
+        lv_blocks1 = {lv: group_items[lv] for lv in order1}
+        lv_modes1 = {lv: "A" for lv in order1}
+
+        res1 = estimate_pls_basic_paper(
+            cog,
+            Xpls=Xpls,
+            item_cols=item_cols,
+            path_df=path1,
+            lv_blocks=lv_blocks1,
+            lv_modes=lv_modes1,
+            order=order1,
         )
-    return path
-
-
-# =========================================================
-# 1) plspm dependency + runner (SmartPLS4-aligned, clean)
-# =========================================================
-def ensure_plspm(auto_install: bool = False):
-    """
-    Import plspm. Optionally pip install if auto_install=True.
-    Returns: (config_module, Plspm, Mode, Scheme)
-    """
-    try:
-        import plspm.config as c
-        from plspm.plspm import Plspm
-        from plspm.mode import Mode
-        from plspm.scheme import Scheme
-        return c, Plspm, Mode, Scheme
-    except Exception as e:
-        if not auto_install:
-            raise ImportError("plspm not installed (or incompatible). Please install/pin it explicitly.") from e
-        subprocess.check_call([sys.executable, "-m", "pip", "-q", "install", "plspm"])
-        import plspm.config as c
-        from plspm.plspm import Plspm
-        from plspm.mode import Mode
-        from plspm.scheme import Scheme
-        return c, Plspm, Mode, Scheme
-
-
-def _scheme_to_plspm_scheme_strict(s: str) -> str:
-    """
-    SmartPLS4-aligned, clean:
-      - allow only PATH / FACTORIAL
-      - CENTROID not supported in SmartPLS4
-      - PCA option here would be an approximation -> disallow
-    """
-    s = (s or "").strip().upper()
-    if s in ("PATH", "PATH_WEIGHTING", "PATHWEIGHTING", ""):
-        return "PATH"
-    if s in ("FACTOR", "FACTORIAL", "FACTOR_WEIGHTING"):
-        return "FACTORIAL"
-    if s in ("CENTROID",):
-        raise ValueError("PLS_SCHEME='CENTROID' is not available in SmartPLS4 (clean mode forbids it).")
-    if s in ("PCA", "PRINCIPAL_COMPONENTS", "PRINCIPAL_COMPONENT_ANALYSIS"):
-        raise ValueError("PLS_SCHEME='PCA' is not allowed in clean mode (would be an approximation).")
-    raise ValueError(f"Unknown PLS_SCHEME: {s}")
-
-
-def run_plspm_python(
-    cog: Any,
-    X: pd.DataFrame,
-    path_df: pd.DataFrame,
-    lv_blocks: Dict[str, List[str]],
-    lv_modes: Dict[str, str],
-    *,
-    scaled: bool = True,
-):
-    """
-    Clean PLS runner:
-      - scheme from cfg.pls.PLS_SCHEME (PATH/FACTORIAL only)
-      - iterations/tolerance from cfg.pls.PLSPM_MAX_ITER / cfg.pls.PLSPM_TOL
-      - no retries with alternative hyperparams
-      - no PCA approximation branch
-      - optional auto-install controlled by cfg.pls.AUTO_INSTALL_PLSPM (if present), else False
-    """
-    cfg = cog.cfg.pls
-
-    scheme = _scheme_to_plspm_scheme_strict(getattr(cfg, "PLS_SCHEME", "PATH"))
-
-    # Read required numeric settings from config (no hidden defaults)
-    if not hasattr(cfg, "PLSPM_MAX_ITER") or not hasattr(cfg, "PLSPM_TOL"):
-        raise AttributeError("Config.pls must define PLSPM_MAX_ITER and PLSPM_TOL (clean mode).")
-    iters = int(cfg.PLSPM_MAX_ITER)
-    tol = float(cfg.PLSPM_TOL)
-
-    auto_install = bool(getattr(cfg, "AUTO_INSTALL_PLSPM", False))
-    c, Plspm, Mode, Scheme = ensure_plspm(auto_install=auto_install)
-    scheme_obj = getattr(Scheme, scheme, Scheme.PATH)
-
-    config = c.Config(path_df, scaled=bool(scaled))
-    for lv, inds in lv_blocks.items():
-        mode = str(lv_modes.get(lv, "A")).upper()
-        mode_obj = Mode.A if mode == "A" else Mode.B
-        mvs = [c.MV(col) for col in inds]
-        config.add_lv(lv, mode_obj, *mvs)
-
-    last_type_err = None
-    model = None
-    for kw in (
-        {"iterations": iters, "tolerance": tol},
-        {"max_iter": iters, "tol": tol},
-    ):
-        try:
-            model = Plspm(X, config, scheme_obj, **kw)
-            break
-        except TypeError as e:
-            last_type_err = e
-            model = None
-        except Exception as e:
-            raise RuntimeError(f"plspm run failed. error={e}") from e
-
-    if model is None:
-        raise TypeError(
-            "plspm API does not accept iterations/tolerance kwargs in this version. "
-            f"Pin a compatible plspm version. last_err={last_type_err}"
-        )
-
-    scores_raw = model.scores() if callable(getattr(model, "scores", None)) else getattr(model, "scores", None)
-    if scores_raw is None:
-        raise AttributeError("plspm model does not expose scores().")
-
-    scores = scores_raw if isinstance(scores_raw, pd.DataFrame) else pd.DataFrame(scores_raw, index=X.index)
-    scores = scores.apply(pd.to_numeric, errors="coerce")
-    return model, scores
-
-
-# =========================================================
-# 2) Measurement helpers
-# =========================================================
-def corr_items_vs_scores(X_items: pd.DataFrame, scores: pd.DataFrame, method: str = "pearson") -> pd.DataFrame:
-    tmp = pd.concat([X_items, scores], axis=1)
-    C = tmp.corr(method=method)
-    return C.loc[X_items.columns, scores.columns]
-
-
-def compute_cr_ave(loadings: np.ndarray) -> Tuple[float, float]:
-    """
-    CR (composite reliability) and AVE for reflective constructs.
-    Uses standardized outer loadings.
-    """
-    lam = np.asarray(loadings, dtype=float)
-    lam = lam[~np.isnan(lam)]
-    if lam.size == 0:
-        return np.nan, np.nan
-    ave = float(np.mean(lam**2))
-    denom = (lam.sum() ** 2) + np.sum(1 - lam**2)
-    cr = float((lam.sum() ** 2) / denom) if denom != 0 else np.nan
-    return cr, ave
-
-
-def quality_paper_table(outer_tbl: pd.DataFrame, lv_modes: dict, order: list[str]) -> pd.DataFrame:
-    """
-    Paper-style quality table:
-      Construct, Mode, CR, AVE
-    Formative: CR/AVE = NaN
-    """
-    rows = []
-    for lv in order:
-        mode = str(lv_modes.get(lv, "A")).upper()
-        if mode != "A":
-            rows.append({"Construct": lv, "Mode": "B(formative)", "CR": np.nan, "AVE": np.nan})
-            continue
-        lam = outer_tbl.loc[outer_tbl["Construct"] == lv, "OuterLoading"].dropna().values.astype(float)
-        cr, ave = compute_cr_ave(lam)
-        rows.append({"Construct": lv, "Mode": "A(reflective)", "CR": cr, "AVE": ave})
-    return pd.DataFrame(rows)
-
-
-def htmt_matrix(
-    X_items: pd.DataFrame,
-    group_items_dict: Dict[str, List[str]],
-    groups_list: List[str],
-    method: str = "pearson",
-) -> pd.DataFrame:
-    R = X_items.corr(method=method).abs()
-    out = pd.DataFrame(index=groups_list, columns=groups_list, dtype=float)
-
-    for i, ga in enumerate(groups_list):
-        A = group_items_dict[ga]
-        RA = R.loc[A, A].values
-        triA = RA[np.triu_indices_from(RA, k=1)]
-        mA = np.nanmean(triA) if triA.size else np.nan
-
-        for j, gb in enumerate(groups_list):
-            if i == j:
-                out.loc[ga, gb] = 1.0
-                continue
-
-            B = group_items_dict[gb]
-            RB = R.loc[B, B].values
-            triB = RB[np.triu_indices_from(RB, k=1)]
-            mB = np.nanmean(triB) if triB.size else np.nan
-
-            HAB = R.loc[A, B].values
-            mAB = np.nanmean(HAB) if HAB.size else np.nan
-
-            denom = np.sqrt(mA * mB) if (pd.notna(mA) and pd.notna(mB) and mA > 0 and mB > 0) else np.nan
-            out.loc[ga, gb] = float(mAB / denom) if pd.notna(denom) else np.nan
-
-    return out.round(3)
-
-
-# =========================================================
-# 3) Model extraction + sign alignment helpers
-# =========================================================
-def _maybe_call(x):
-    return x() if callable(x) else x
-
-
-def _first_existing_attr(obj, names: List[str]):
-    for n in names:
-        if hasattr(obj, n):
-            return getattr(obj, n)
-    return None
-
-
-def _ensure_df(x) -> Optional[pd.DataFrame]:
-    if x is None:
-        return None
-    if isinstance(x, pd.DataFrame):
-        return x
-    try:
-        return pd.DataFrame(x)
-    except Exception:
-        return None
-
-
-def get_sign_map_by_anchors(X_df: pd.DataFrame, scores_df: pd.DataFrame, anchors: Dict[str, str]) -> Dict[str, int]:
-    """
-    Return LV sign (+1/-1) based on corr(anchor_indicator, LV_score).
-    """
-    sign: Dict[str, int] = {}
-    for lv, a in anchors.items():
-        if lv not in scores_df.columns or a not in X_df.columns:
-            continue
-        r = X_df[a].corr(scores_df[lv])
-        sign[lv] = -1 if (pd.notna(r) and r < 0) else 1
-    return sign
-
-
-def apply_sign_to_paths(paths_long: pd.DataFrame, sign_map: dict) -> pd.DataFrame:
-    """
-    b' = b * s_to * s_from
-    """
-    if paths_long is None or paths_long.empty:
-        return paths_long
-    out = paths_long.copy()
-    s_from = out["from"].map(lambda x: sign_map.get(x, 1)).astype(float)
-    s_to = out["to"].map(lambda x: sign_map.get(x, 1)).astype(float)
-    out["estimate"] = pd.to_numeric(out["estimate"], errors="coerce") * s_to * s_from
-    return out
-
-
-def apply_sign_to_outer(outer_df: pd.DataFrame, sign_map: dict) -> pd.DataFrame:
-    if outer_df is None or outer_df.empty:
-        return outer_df
-    out = outer_df.copy()
-    s = out["Construct"].map(lambda x: sign_map.get(x, 1)).astype(float)
-    for col in ["OuterLoading", "OuterWeight"]:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce") * s
-    if "Communality(h2)" in out.columns and "OuterLoading" in out.columns:
-        out["Communality(h2)"] = pd.to_numeric(out["OuterLoading"], errors="coerce") ** 2
-    return out
-
-
-def get_path_results(
-    model,
-    path_df: pd.DataFrame,
-    *,
-    strict: bool = True,
-    scores_df: Optional[pd.DataFrame] = None
-) -> pd.DataFrame:
-    """
-    Prefer extracting path coefficients from plspm model.
-    If strict=False, fallback to OLS(scores) when unavailable.
-
-    Return long format: from,to,estimate
-    """
-    cand = _first_existing_attr(model, ["path_coefficients", "path_coefs", "inner_model", "inner_summary"])
-    cand = _maybe_call(cand)
-    M = _ensure_df(cand)
-
-    # matrix form (index=to, columns=from)
-    if M is not None and (set(path_df.index).issubset(set(M.index)) and set(path_df.columns).issubset(set(M.columns))):
-        rows = []
-        for to in path_df.index:
-            for fr in path_df.columns:
-                if int(path_df.loc[to, fr]) == 1:
-                    rows.append({"from": fr, "to": to, "estimate": float(M.loc[to, fr])})
-        return pd.DataFrame(rows)
-
-    # long form
-    if M is not None:
-        cols = {c.lower(): c for c in M.columns}
-        if ("from" in cols and "to" in cols) and ("estimate" in cols or "path" in cols or "coef" in cols):
-            est_col = cols.get("estimate") or cols.get("path") or cols.get("coef")
-            out = M.rename(columns={cols["from"]: "from", cols["to"]: "to", est_col: "estimate"})[["from", "to", "estimate"]]
-            keep = []
-            for _, r in out.iterrows():
-                fr, to = r["from"], r["to"]
-                keep.append((to in path_df.index) and (fr in path_df.columns) and int(path_df.loc[to, fr]) == 1)
-            return out.loc[keep].reset_index(drop=True)
-
-    if strict:
-        raise AttributeError("Cannot extract path coefficients from plspm model API.")
-
-    if scores_df is None:
-        return pd.DataFrame()
-    return path_estimates_from_scores(scores_df, path_df)
-
-
-def get_outer_results(
-    model,
-    X: pd.DataFrame,
-    scores_df: pd.DataFrame,
-    lv_blocks: dict,
-    lv_modes: dict,
-    *,
-    strict: bool = True,
-) -> pd.DataFrame:
-    """
-    Prefer extracting outer loadings/weights from plspm model.
-    If strict=False, fallback to corr(indicator, LVscore) for reflective loadings.
-
-    Return columns:
-      Construct, Indicator, Mode, OuterLoading, OuterWeight, Communality(h2)
-    """
-    cand = _first_existing_attr(model, ["outer_model", "outer", "outer_summary", "measurement_model"])
-    cand = _maybe_call(cand)
-    OM = _ensure_df(cand)
-
-    if OM is not None and not OM.empty:
-        cols = {c.lower(): c for c in OM.columns}
-        c_construct = cols.get("block") or cols.get("construct") or cols.get("lv") or cols.get("latent") or cols.get("name_lv")
-        c_ind = cols.get("name") or cols.get("indicator") or cols.get("mv") or cols.get("manifest") or cols.get("name_mv")
-        c_loading = cols.get("loading") or cols.get("outer_loading")
-        c_weight = cols.get("weight") or cols.get("outer_weight")
-
-        if c_construct and c_ind:
-            out = pd.DataFrame({
-                "Construct": OM[c_construct].astype(str),
-                "Indicator": OM[c_ind].astype(str),
-                "OuterLoading": pd.to_numeric(OM[c_loading], errors="coerce") if c_loading else np.nan,
-                "OuterWeight": pd.to_numeric(OM[c_weight], errors="coerce") if c_weight else np.nan,
-            })
-            out["Mode"] = out["Construct"].map(lambda lv: str(lv_modes.get(lv, "A")).upper())
-            out["Mode"] = out["Mode"].map(lambda m: "A(reflective)" if m == "A" else "B(formative)")
-            out["Communality(h2)"] = pd.to_numeric(out["OuterLoading"], errors="coerce") ** 2
-            return out[["Construct", "Indicator", "Mode", "OuterLoading", "OuterWeight", "Communality(h2)"]]
-
-    if strict:
-        raise AttributeError("Cannot extract outer model (loadings/weights) from plspm model API.")
-
-    cross = corr_items_vs_scores(X, scores_df, method="pearson")
-    rows = []
-    for lv, inds in lv_blocks.items():
-        mode = str(lv_modes.get(lv, "A")).upper()
-        for it in inds:
-            if it not in cross.index or lv not in cross.columns:
-                continue
-            ol = float(cross.loc[it, lv])
-            rows.append({
-                "Construct": lv,
-                "Indicator": it,
-                "Mode": "A(reflective)" if mode == "A" else "B(formative)",
-                "OuterLoading": ol if mode == "A" else np.nan,
-                "OuterWeight": np.nan,
-                "Communality(h2)": (ol ** 2) if mode == "A" else np.nan,
-            })
-    return pd.DataFrame(rows)
-
-
-# =========================================================
-# 4) Structural helpers (diagnostics)
-# =========================================================
-def preds_for_endogenous(path_df: pd.DataFrame, to: str) -> List[str]:
-    return [c for c in path_df.columns if path_df.loc[to, c] == 1]
-
-
-def ols_fit(y: np.ndarray, X: np.ndarray) -> Tuple[np.ndarray, float]:
-    """
-    OLS with intercept:
-      y = b0 + b1 x1 + ... + bp xp
-    Returns (beta, R2)
-    """
-    y = np.asarray(y, dtype=float).reshape(-1, 1)
-    X = np.asarray(X, dtype=float)
-    X1 = np.column_stack([np.ones((X.shape[0], 1)), X])
-
-    beta = np.linalg.lstsq(X1, y, rcond=None)[0].flatten()
-    yhat = (X1 @ beta.reshape(-1, 1)).flatten()
-    y0 = y.flatten()
-
-    sse = float(np.sum((y0 - yhat) ** 2))
-    sst = float(np.sum((y0 - np.mean(y0)) ** 2))
-    r2 = 1 - sse / sst if sst > 1e-12 else np.nan
-    return beta, float(r2)
-
-
-def path_estimates_from_scores(scores_df: pd.DataFrame, path_df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for to in path_df.index:
-        preds = [p for p in preds_for_endogenous(path_df, to) if p in scores_df.columns]
-        if len(preds) == 0 or to not in scores_df.columns:
-            continue
-        beta, _ = ols_fit(scores_df[to].values, scores_df[preds].values)
-        for j, fr in enumerate(preds):
-            rows.append({"from": fr, "to": to, "estimate": float(beta[1 + j])})
-    return pd.DataFrame(rows)
-
-
-def r2_f2_from_scores(scores_df: pd.DataFrame, path_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    r2_rows, f2_rows = [], []
-    for to in path_df.index:
-        preds = [p for p in preds_for_endogenous(path_df, to) if p in scores_df.columns]
-        if len(preds) == 0 or to not in scores_df.columns:
-            continue
-
-        _, r2_full = ols_fit(scores_df[to].values, scores_df[preds].values)
-        r2_rows.append({"Construct": to, "R2": r2_full, "Predictors": ", ".join(preds)})
-
-        for p in preds:
-            preds_ex = [x for x in preds if x != p]
-            if len(preds_ex) == 0:
-                r2_ex = 0.0
+        PLS1_cross = res1["PLS_cross"]
+        PLS1_outer = res1["PLS_outer"]
+        PLS1_quality = res1["PLS_quality"]
+        scores1 = res1["scores"]
+
+        PLS1_htmt = htmt_matrix(Xpls[item_cols], {g: lv_blocks1[g] for g in order1}, order1, method=cfg.pls.HTMT_CORR_METHOD)
+
+        PLS1_R2, PLS1_f2 = r2_f2_from_scores(scores1[order1], path1)
+        PLS1_Q2 = q2_cv_from_scores(scores1[order1], path1, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
+        PLS1_VIF = structural_vif(scores1[order1], path1)
+
+        PLS1_info = pd.DataFrame([{
+            "Model": f"Model1 baseline (ACO/CCO separate) [{tag}]",
+            "order": " > ".join(order1),
+            "n(PLS)": int(Xpls.shape[0]),
+            "scheme": cfg.pls.PLS_SCHEME,
+            "missing": cfg.pls.PLS_MISSING,
+            "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
+            "estimates": "outer/path from plspm model API (strict)"
+        }])
+
+        # ---- Model2 (two-stage Commitment formative) ----
+        edges2 = [
+            ("SA", "MIND"), ("SA", "Commitment"),
+            ("PA", "BB"), ("PA", "BS"),
+            ("BS", "MIND"), ("BS", "Commitment"), ("BS", "CI"),
+            ("MIND", "CI"), ("BB", "CI"), ("Commitment", "CI"),
+            ("CI", "LO"),
+        ]
+        lv_set2 = [g for g in ["PA", "SA", "BB", "BS", "MIND", "CI", "LO"] if g in groups] + ["Commitment"]
+        order2 = topo_sort(lv_set2, edges2)
+        path2 = make_plspm_path(order2, edges2)
+
+        if ("ACO" not in scores1.columns) or ("CCO" not in scores1.columns):
+            raise KeyError("Model2 requires ACO and CCO scores from Model1.")
+        if scores1[["ACO", "CCO"]].isna().any().any():
+            raise ValueError("Stage1 ACO/CCO scores contain NaN. Clean mode forbids fillna(mean).")
+
+        Xpls2 = Xpls.copy()
+        Xpls2["ACO_score"] = scores1["ACO"].to_numpy()
+        Xpls2["CCO_score"] = scores1["CCO"].to_numpy()
+
+        lv_blocks2 = {}
+        for lv in order2:
+            if lv == "Commitment":
+                lv_blocks2[lv] = ["ACO_score", "CCO_score"]
             else:
-                _, r2_ex = ols_fit(scores_df[to].values, scores_df[preds_ex].values)
-            denom = (1 - r2_full)
-            f2 = (r2_full - r2_ex) / denom if denom > 1e-12 else np.nan
-            f2_rows.append({"from": p, "to": to, "f2": f2, "R2_full": r2_full, "R2_excluded": r2_ex})
+                lv_blocks2[lv] = group_items[lv]
+        lv_modes2 = {lv: ("B" if lv == "Commitment" else "A") for lv in order2}
 
-    return pd.DataFrame(r2_rows).round(4), pd.DataFrame(f2_rows).round(4)
+        stage2_indicators = []
+        for lv in order2:
+            stage2_indicators += lv_blocks2[lv]
+        stage2_indicators = list(dict.fromkeys(stage2_indicators))
 
+        res2 = estimate_pls_basic_paper(
+            cog,
+            Xpls=Xpls2,
+            item_cols=stage2_indicators,
+            path_df=path2,
+            lv_blocks=lv_blocks2,
+            lv_modes=lv_modes2,
+            order=order2,
+        )
+        PLS2_cross = res2["PLS_cross"]
+        PLS2_outer = res2["PLS_outer"]
+        PLS2_quality = res2["PLS_quality"]
+        scores2 = res2["scores"]
 
-def q2_cv_from_scores(
-    scores_df: pd.DataFrame,
-    path_df: pd.DataFrame,
-    *,
-    n_splits: int,
-    seed: int,
-) -> pd.DataFrame:
-    """
-    Cross-validated Q² (NOT SmartPLS blindfolding Q²).
-    """
-    n = scores_df.shape[0]
-    k = max(2, min(int(n_splits), int(n)))
-    kf = KFold(n_splits=k, shuffle=True, random_state=int(seed))
+        refl2 = [lv for lv in order2 if lv != "Commitment"]
+        PLS2_htmt = htmt_matrix(Xpls[item_cols], {g: group_items[g] for g in refl2}, refl2, method=cfg.pls.HTMT_CORR_METHOD)
 
-    rows = []
-    for to in path_df.index:
-        preds = [p for p in preds_for_endogenous(path_df, to) if p in scores_df.columns]
-        if len(preds) == 0 or to not in scores_df.columns:
-            continue
+        PLS2_R2, PLS2_f2 = r2_f2_from_scores(scores2[order2], path2)
+        PLS2_Q2 = q2_cv_from_scores(scores2[order2], path2, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
+        PLS2_VIF = structural_vif(scores2[order2], path2)
 
-        y = scores_df[to].values.astype(float)
-        X = scores_df[preds].values.astype(float)
+        PLS2_commitment = PLS2_outer[PLS2_outer["Construct"] == "Commitment"].copy()
 
-        sse, sso = 0.0, 0.0
-        y_mean = float(np.mean(y))
+        PLS2_info = pd.DataFrame([{
+            "Model": f"Model2 two-stage (Commitment formative) [{tag}]",
+            "order": " > ".join(order2),
+            "n(PLS)": int(Xpls.shape[0]),
+            "scheme": cfg.pls.PLS_SCHEME,
+            "missing": cfg.pls.PLS_MISSING,
+            "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
+            "estimates": "outer/path from plspm model API (strict)"
+        }])
 
-        for tr, te in kf.split(X):
-            beta, _ = ols_fit(y[tr], X[tr])
-            Xte1 = np.column_stack([np.ones((len(te), 1)), X[te]])
-            yhat = (Xte1 @ beta.reshape(-1, 1)).flatten()
-            yte = y[te]
-            sse += float(np.sum((yte - yhat) ** 2))
-            sso += float(np.sum((yte - y_mean) ** 2))
+        # Optional: Bootstrap direct paths (if you already generate boot arrays elsewhere)
+        # Here left empty unless you implement full bootstrap loop.
+        PLS1_BOOTPATH = pd.DataFrame()
+        PLS2_BOOTPATH = pd.DataFrame()
 
-        q2 = 1 - sse / sso if sso > 1e-12 else np.nan
-        rows.append({"Construct": to, "Q2_CV": q2, "Predictors": ", ".join(preds), "folds": k})
+    # ==============================
+    # Export Excel + CSV
+    # ==============================
+    with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as writer:
+        if cfg.io.EXPORT_EXCLUDED_SHEET and (excluded_df is not None) and (not excluded_df.empty):
+            excluded_df.to_excel(writer, sheet_name="排除樣本", index=False)
 
-    return pd.DataFrame(rows).round(4)
+        ws = get_or_create_ws(writer, cfg.io.PAPER_SHEET)
+        r = 0
+        r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"A. Reliability summary (α / ωt) [{tag}]", RelTable, index=False)
+        r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"B. Item analysis (all constructs stacked) [{tag}]",
+                        ItemTable[["Construct","Item","n(complete)","Mean","SD","CITC","α if deleted","ωt if deleted"]], index=False)
+        r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"C. One-factor loadings (sklearn FA, all constructs stacked) [{tag}]",
+                        FA1Table[["Construct","Item","n(complete)","Loading","h2","psi"]], index=False)
+        r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"D. One-factor EFA per construct (factor_analyzer, all constructs stacked) [{tag}]",
+                        EFA1Table[["Construct","Item","n(complete)","EFA Loading","h2","psi"]], index=False)
+        if EFA1Fit is not None and (not EFA1Fit.empty):
+            r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"D-2. EFA suitability (KMO / Bartlett) per construct [{tag}]",
+                            EFA1Fit[["Construct","n(complete)","k(items)","KMO","Bartlett_p"]], index=False)
 
-
-def structural_vif(scores_df: pd.DataFrame, path_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Inner VIF (structural VIF) based on LV scores:
-      VIF_x = 1 / (1 - R2_x|others)
-    """
-    rows = []
-    for to in path_df.index:
-        preds = [p for p in preds_for_endogenous(path_df, to) if p in scores_df.columns]
-        if len(preds) < 2:
-            if len(preds) == 1:
-                rows.append({"Endogenous": to, "Predictor": preds[0], "VIF": 1.0})
-            continue
-
-        for x in preds:
-            others = [p for p in preds if p != x]
-            _, r2 = ols_fit(scores_df[x].values, scores_df[others].values)
-            vif = 1.0 / (1.0 - r2) if (1.0 - r2) > 1e-12 else np.inf
-            rows.append({"Endogenous": to, "Predictor": x, "VIF": vif})
-
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out["VIF"] = out["VIF"].round(3)
-    return out
-
-
-# =========================================================
-# 5) Effects (direct/indirect/total)
-# =========================================================
-def effects_total_indirect(
-    order_nodes: List[str],
-    edges: List[Tuple[str, str]],
-    coef_map: Dict[Tuple[str, str], float],
-) -> Tuple[pd.DataFrame, List[Tuple[str, str]]]:
-    out_adj = {u: [] for u in order_nodes}
-    for u, v in edges:
-        if u in out_adj:
-            out_adj[u].append(v)
-
-    pairs = []
-    for s in order_nodes:
-        reach = {n: 0.0 for n in order_nodes}
-        reach[s] = 1.0
-        for u in order_nodes:
-            for v in out_adj.get(u, []):
-                reach[v] += reach[u]
-        for t in order_nodes:
-            if t != s and reach[t] != 0:
-                pairs.append((s, t))
-    pairs = list(dict.fromkeys(pairs))
-
-    total = {}
-    for s in order_nodes:
-        eff = {n: 0.0 for n in order_nodes}
-        eff[s] = 1.0
-        for u in order_nodes:
-            for v in out_adj.get(u, []):
-                b = float(coef_map.get((u, v), 0.0))
-                eff[v] += eff[u] * b
-        for t in order_nodes:
-            if t != s:
-                total[(s, t)] = float(eff[t])
-
-    rows = []
-    for s, t in pairs:
-        direct = float(coef_map.get((s, t), 0.0))
-        tot = float(total.get((s, t), 0.0))
-        indir = tot - direct
-        rows.append({"from": s, "to": t, "direct": direct, "indirect": indir, "total": tot})
-
-    return pd.DataFrame(rows), pairs
+        if cfg.cfa.RUN_CFA:
+            r = write_block(writer, c_
