@@ -129,7 +129,8 @@ class PLSConfig:
     BOOT_RETRY: int = 0
     BOOT_CI_LO: float = 0.025
     BOOT_CI_HI: float = 0.975
-
+    BOOT_ALPHA: float = 0.05
+    BOOT_TEST_TYPE: str = \"two-tailed\"
     # ---- Model1 / Model2 control ----
     RUN_MODEL1: bool = True
     RUN_MODEL2: bool = True
