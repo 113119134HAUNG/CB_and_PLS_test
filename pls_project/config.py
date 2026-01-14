@@ -110,12 +110,12 @@ class PLSConfig:
     PLS_STANDARDIZED: bool = True
     PLSPM_MAX_ITER: int = 3000
     PLSPM_TOL: float = 1e-7
-
+    PLS_MISSING: str = "listwise"   # "none" | "listwise" | "mean"
+    
     # ---- Correlation methods ----
     HTMT_CORR_METHOD: str = "pearson"
     PLS_CROSS_CORR_METHOD: str = "pearson"
-    PLS_MISSING: str = "listwise"   # "none" | "listwise" | "mean"
-    
+
     # ---- Sign orientation ----
     SIGN_FIX: bool = True
 
@@ -190,4 +190,5 @@ class Config:
     cfa: CFAConfig = field(default_factory=CFAConfig)
     pls: PLSConfig = field(default_factory=PLSConfig)
     mga: MGAConfig = field(default_factory=MGAConfig)
-    scenario: ScenarioConfig = fi
+    scenario: ScenarioConfig = field(default_factory=ScenarioConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
