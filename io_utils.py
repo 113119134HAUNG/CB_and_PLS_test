@@ -52,9 +52,8 @@ def reverse_1to5(x):
 
 def safe_t(est: np.ndarray, se: np.ndarray):
     """
-    Clean (distribution-free) t-statistic:
+    Distribution-free t statistic:
       t = |estimate| / SE
-    No p-value is computed (avoids distributional assumptions).
     """
     est = np.asarray(est, dtype=float)
     se  = np.asarray(se, dtype=float)
@@ -63,17 +62,24 @@ def safe_t(est: np.ndarray, se: np.ndarray):
 
 def ci_sig(ci_l: np.ndarray, ci_u: np.ndarray):
     """
-    CI-based significance (distribution-free):
-      significant if 0 is NOT inside [CI_l, CI_u]
-    Returns boolean array.
+    CI-based significance:
+      significant if 0 NOT in [ci_l, ci_u]
     """
     ci_l = np.asarray(ci_l, dtype=float)
     ci_u = np.asarray(ci_u, dtype=float)
     ok = np.isfinite(ci_l) & np.isfinite(ci_u)
     sig = np.full_like(ci_l, False, dtype=bool)
-    # 0 not in interval => (ci_u < 0) or (ci_l > 0)
     sig[ok] = (ci_u[ok] < 0) | (ci_l[ok] > 0)
     return sig
+
+def safe_t_p(est: np.ndarray, se: np.ndarray):
+    """
+    Backward-compatible wrapper.
+    p-value is intentionally NOT computed (NaN) to avoid distribution assumptions.
+    """
+    t = safe_t(est, se)
+    p = np.full_like(t, np.nan, dtype=float)
+    return t, p
 
 def get_or_create_ws(writer, sheet_name: str):
     if sheet_name in writer.book.sheetnames:
