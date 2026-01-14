@@ -1,139 +1,129 @@
 # pls_project/schema.py
 from __future__ import annotations
-from dataclasses import replace
-from typing import Sequence, Optional, Dict, List, Tuple
 import re
 import difflib
 import pandas as pd
-
-from .config import Config, ColumnConfig
 from .rulebook import META_RULES, PROFILES
+from .io_utils import _norm_text
 
-# ------------------------------
-# helpers
-# ------------------------------
-def _norm_cols(columns: Sequence[str]) -> List[str]:
-    return [str(c).strip().replace("\u3000", " ") for c in columns]
+def _norm_col(c: str) -> str:
+    # 統一空白/全形空白，去頭尾
+    return _norm_text(c)
 
-def _first_match(cols: List[str], patterns: List[str], mode: str) -> Optional[str]:
-    if mode == "exact":
-        for p in patterns:
-            for c in cols:
-                if c == p:
-                    return c
-    elif mode == "contains":
-        for p in patterns:
-            for c in cols:
-                if p in c:
-                    return c
-    elif mode == "regex":
-        for p in patterns:
-            for c in cols:
-                if re.search(p, c, flags=re.I):
-                    return c
+def _first_real_col(columns) -> str:
+    # 避免遇到 excel 匯出有 "Unnamed: 0"
+    for c in columns:
+        s = _norm_col(c)
+        if not s:
+            continue
+        if s.lower().startswith("unnamed"):
+            continue
+        return c
+    return columns[0]
+
+def _match_meta(colnames_norm: list[str], key: str) -> int | None:
+    rule = META_RULES[key]
+    # exact
+    exact = set(_norm_col(x) for x in rule.get("exact", []))
+    for i, cn in enumerate(colnames_norm):
+        if cn in exact:
+            return i
+
+    # contains
+    contains = [_norm_col(x) for x in rule.get("contains", [])]
+    for i, cn in enumerate(colnames_norm):
+        for frag in contains:
+            if frag and frag.lower() in cn.lower():
+                return i
+
+    # regex
+    for pat in rule.get("regex", []):
+        rx = re.compile(pat, flags=re.I)
+        for i, cn in enumerate(colnames_norm):
+            if rx.search(cn):
+                return i
+
+    # fuzzy（最後手段）
+    hint = _norm_col(rule.get("fuzzy_hint", ""))
+    if hint:
+        best_i = None
+        best = 0.0
+        for i, cn in enumerate(colnames_norm):
+            score = difflib.SequenceMatcher(None, hint, cn).ratio()
+            if score > best:
+                best = score
+                best_i = i
+        if best_i is not None and best >= 0.72:
+            return best_i
+
     return None
 
-def _fuzzy(cols: List[str], hint: str) -> Optional[str]:
-    m = difflib.get_close_matches(hint, cols, n=1, cutoff=0.72)
-    return m[0] if m else None
+def detect_profile(columns: list[str]) -> tuple[str, list[str], str]:
+    # 回傳：profile_name, scale_prefixes, item_token_regex
+    cols_norm = [_norm_col(c) for c in columns]
+    best = ("unknown", [], "")
+    best_hits = 0
 
-# ------------------------------
-# meta columns resolve
-# ------------------------------
-def resolve_columns(col_cfg: ColumnConfig, columns: Sequence[str]) -> ColumnConfig:
-    """把 ColumnConfig 對到 df.columns 的實際欄名（無副作用）。"""
-    cols = _norm_cols(columns)
+    for p in PROFILES:
+        sigs = set(p["signatures_any"])
+        hits = sum(1 for cn in cols_norm if any(sig in cn for sig in sigs))
+        if hits > best_hits:
+            best_hits = hits
+            best = (p["name"], p["scale_prefixes"], p["item_token_regex"])
 
-    def pick(current: str, field: str) -> str:
-        if current in cols:
-            return current
-        rule = META_RULES.get(field, {})
-        hit = (
-            _first_match(cols, rule.get("exact", []), "exact")
-            or _first_match(cols, rule.get("contains", []), "contains")
-            or _first_match(cols, rule.get("regex", []), "regex")
-            or _fuzzy(cols, rule.get("fuzzy_hint", current))
-        )
-        return hit if hit else current
+    return best
 
-    return replace(
-        col_cfg,
-        TS_COL=pick(col_cfg.TS_COL, "TS_COL"),
-        USER_COL=pick(col_cfg.USER_COL, "USER_COL"),
-        EMAIL_COL=pick(col_cfg.EMAIL_COL, "EMAIL_COL"),
-        EXP_COL=pick(col_cfg.EXP_COL, "EXP_COL"),
-    )
+def build_rename_map(columns: list[str], item_token_regex: str) -> dict[str, str]:
+    rename = {}
+    if not item_token_regex:
+        return rename
+    rx = re.compile(item_token_regex)
+    for c in columns:
+        m = rx.search(_norm_col(c))
+        if m:
+            rename[c] = m.group(1)
+    return rename
 
-# ------------------------------
-# profile detection + item tokenization
-# ------------------------------
-def detect_profile(columns: Sequence[str]) -> str:
-    cols = _norm_cols(columns)
-    s = set(cols)
-    best_name, best_score = "unknown", -1
-    for prof in PROFILES:
-        score = sum(1 for x in prof["signatures_any"] if x in s)
-        if score > best_score:
-            best_score, best_name = score, prof["name"]
-    return best_name
-
-def extract_item_token(colname: str, profile_name: str) -> Optional[str]:
-    colname = str(colname).strip().replace("\u3000", " ")
-    prof = next((p for p in PROFILES if p["name"] == profile_name), None)
-    if not prof:
-        m = re.match(r"^([A-Z]{1,6}\d{1,2})\b", colname)
-        return m.group(1) if m else None
-    m = re.match(prof["item_token_regex"], colname)
-    return m.group(1) if m else None
-
-def build_rename_map_for_items(columns: Sequence[str]) -> Tuple[str, Dict[str, str], List[str]]:
+def resolve_schema(df: pd.DataFrame, cfg, cog=None):
     """
-    回傳：
-      profile_name
-      rename_map: 原欄名 -> token（只對可抽 token 的欄位）
-      scale_prefixes: 該版本的 prefix 清單
+    你只要呼叫這個：
+      cols_resolved, profile_name, scale_prefixes, rename_map = resolve_schema(df, cfg, cog)
+    會：
+    - TS_COL：直接取 df 第一個“有效欄位”
+    - 其他 meta：用 rulebook 盡量自動辨識
+    - profile：自動判 v1/v2/v3
+    - rename_map：把題項欄位轉成 token
+    - 寫回 cfg.runtime（以及 cog，如果有給）
     """
-    cols = _norm_cols(columns)
-    profile_name = detect_profile(cols)
-    prof = next((p for p in PROFILES if p["name"] == profile_name), None)
+    columns = list(df.columns)
+    cols_norm = [_norm_col(c) for c in columns]
 
-    rename_map: Dict[str, str] = {}
-    for c in cols:
-        tok = extract_item_token(c, profile_name)
-        if tok:
-            rename_map[c] = tok
+    resolved = {}
+    # 你要的：第一欄直接當 TS_COL
+    resolved["TS_COL"] = _first_real_col(columns)
 
-    scale_prefixes = prof["scale_prefixes"] if prof else []
-    return profile_name, rename_map, scale_prefixes
+    # 其餘 meta 欄位：用 rulebook 找得到就填，找不到就略過
+    for k in ["USER_COL", "EMAIL_COL", "EXP_COL"]:
+        idx = _match_meta(cols_norm, k)
+        if idx is not None:
+            resolved[k] = columns[idx]
 
-# ------------------------------
-# ✅ main entry: apply to cfg
-# ------------------------------
-def apply_schema_to_config(cfg: Config, df: pd.DataFrame, *, mutate_df: bool = True) -> pd.DataFrame:
-    """
-    schema 工作流程（你要的）：
-      1) normalize 欄名
-      2) detect profile + tokenize items (rename to token)
-      3) resolve meta columns
-      4) 填充回 cfg.cols / cfg.runtime
-    """
-    if not mutate_df:
-        df = df.copy()
+    profile_name, scale_prefixes, item_token_regex = detect_profile(columns)
+    rename_map = build_rename_map(columns, item_token_regex)
 
-    # 1) normalize columns
-    df.columns = _norm_cols(df.columns)
-
-    # 2) profile + item token rename
-    profile_name, rename_map, scale_prefixes = build_rename_map_for_items(df.columns)
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    # 3) resolve meta columns (after rename)
-    cfg.cols = resolve_columns(cfg.cols, df.columns)
-
-    # 4) fill runtime
+    # 寫回 runtime
     cfg.runtime.profile_name = profile_name
-    cfg.runtime.scale_prefixes = scale_prefixes
-    cfg.runtime.rename_map = rename_map
+    cfg.runtime.scale_prefixes = list(scale_prefixes)
+    cfg.runtime.rename_map = dict(rename_map)
+    cfg.runtime.resolved_cols = dict(resolved)
 
-    return df
+    if cog is not None:
+        cog.cols_resolved = dict(resolved)
+        cog.profile_name = profile_name
+        cog.scale_prefixes = list(scale_prefixes)
+        if hasattr(cog, "log") and cog.log:
+            cog.log.info(f"schema profile={profile_name}, first_col(TS)={resolved['TS_COL']}")
+            cog.log.info(f"resolved meta={resolved}")
+            cog.log.info(f"rename_map items={len(rename_map)}")
+
+    return resolved, profile_name, scale_prefixes, rename_map
