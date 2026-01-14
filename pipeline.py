@@ -86,7 +86,6 @@ def _bootstrap_paths_single_model(
                     scaled=bool(getattr(cfg, "PLS_STANDARDIZED", True)),
                 )
 
-                # for sign map only
                 sb = sb[order].copy()
 
                 if sign_fix_on and anchors:
@@ -109,8 +108,7 @@ def _bootstrap_paths_single_model(
                 ok = False
                 continue
 
-        # optional progress
-        if (b % 200) == 0:
+        if (b % 200) == 0 and hasattr(cog, "log") and cog.log:
             cog.log.info(f"Bootstrap(single) {b}/{B} ok={ok}")
 
     return boot
@@ -125,6 +123,9 @@ def _bootstrap_paths_two_stage_model2(
     lv_modes1: dict,
     order1: list[str],
     anchors1: dict,
+    commitment_name: str,
+    comp_lvs: list[str],
+    comp_cols: list[str],
     path2: pd.DataFrame,
     lv_blocks2: dict,
     lv_modes2: dict,
@@ -135,8 +136,8 @@ def _bootstrap_paths_two_stage_model2(
     """
     Bootstrap Model2 (two-stage):
       - resample original indicators
-      - stage1: re-run Model1 to obtain ACO/CCO scores (sign-aligned)
-      - create ACO_score / CCO_score
+      - stage1: re-run Model1 to obtain component LV scores (sign-aligned)
+      - create component score columns in Xb2
       - stage2: run Model2 and extract path coefficients (sign-aligned)
     """
     cfg = cog.cfg.pls
@@ -171,15 +172,15 @@ def _bootstrap_paths_two_stage_model2(
                     sign_map1b = get_sign_map_by_anchors(Xb, s1b, anchors1)
                     s1b = _apply_sign_to_scores(s1b, sign_map1b)
 
-                if ("ACO" not in s1b.columns) or ("CCO" not in s1b.columns):
-                    raise RuntimeError("Stage1 bootstrap missing ACO/CCO scores.")
-
-                if s1b[["ACO", "CCO"]].isna().any().any():
-                    raise RuntimeError("Stage1 bootstrap ACO/CCO scores contain NaN (clean mode forbids fill).")
+                for lv in comp_lvs:
+                    if lv not in s1b.columns:
+                        raise RuntimeError(f"Stage1 bootstrap missing component LV score: {lv}")
+                if s1b[comp_lvs].isna().any().any():
+                    raise RuntimeError("Stage1 bootstrap component scores contain NaN (clean mode forbids fill).")
 
                 Xb2 = Xb.copy()
-                Xb2["ACO_score"] = s1b["ACO"].to_numpy()
-                Xb2["CCO_score"] = s1b["CCO"].to_numpy()
+                for lv, col in zip(comp_lvs, comp_cols):
+                    Xb2[col] = s1b[lv].to_numpy()
 
                 # ---- stage2 ----
                 m2b, s2b = run_plspm_python(
@@ -213,7 +214,7 @@ def _bootstrap_paths_two_stage_model2(
                 ok = False
                 continue
 
-        if (b % 200) == 0:
+        if (b % 200) == 0 and hasattr(cog, "log") and cog.log:
             cog.log.info(f"Bootstrap(two-stage) {b}/{B} ok={ok}")
 
     return boot2
@@ -254,6 +255,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     EMAIL_COL = resolved_cols.get("EMAIL_COL", cfg.cols.EMAIL_COL)
     EXP_COL = resolved_cols.get("EXP_COL", cfg.cols.EXP_COL)
 
+    # meta columns may be renamed (rare, but guard)
     if rename_map:
         TS_COL = rename_map.get(TS_COL, TS_COL)
         USER_COL = rename_map.get(USER_COL, USER_COL)
@@ -267,8 +269,8 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     # ==============================
     scale_alt = "|".join(map(re.escape, SCALES))
     item_pat = re.compile(rf"^(?:{scale_alt})\d{{1,2}}$")
-
     item_cols = [c for c in df.columns if item_pat.fullmatch(str(c))]
+
     if not item_cols:
         raise ValueError(
             f"找不到題項欄位！profile={profile_name}, prefixes={SCALES}. "
@@ -297,10 +299,16 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         REVERSE_ITEMS += list(group_items[cfg.scenario.SCENARIO_TARGET])
 
     # ==============================
-    # Flags (experience / duplication / careless)
+    # Flags (experience / duplication / careless) with config switches
     # ==============================
+    fcfg = cfg.filt
+    FILTER_NOEXP = bool(getattr(fcfg, "FILTER_NOEXP", True))
+    FILTER_DUP = bool(getattr(fcfg, "FILTER_DUPLICATE", True))
+    FILTER_CARELESS = bool(getattr(fcfg, "FILTER_CARELESS", True))
+
     df["_flag_noexp"] = False
     df["_flag_dup"] = False
+    df["_flag_careless"] = False
 
     def has_experience(x) -> bool:
         if pd.isna(x):
@@ -316,17 +324,20 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             return True
         return False
 
-    if EXP_COL in df.columns:
+    # 1) No experience
+    if FILTER_NOEXP and (EXP_COL in df.columns):
         df["_flag_noexp"] = ~df[EXP_COL].apply(has_experience)
 
-    df["_ts"] = pd.to_datetime(df[TS_COL], errors="coerce") if TS_COL in df.columns else pd.NaT
-    df["_orig_order"] = np.arange(len(df))
+    # 2) Duplicate
+    if FILTER_DUP:
+        df["_ts"] = pd.to_datetime(df[TS_COL], errors="coerce") if TS_COL in df.columns else pd.NaT
+        df["_orig_order"] = np.arange(len(df))
 
-    dup_key = [c for c in [USER_COL, EMAIL_COL] if c in df.columns]
-    if dup_key:
-        df_sorted = df.sort_values(["_ts", "_orig_order"], na_position="last").copy()
-        df_sorted["_flag_dup"] = df_sorted.duplicated(subset=dup_key, keep=cfg.filt.KEEP_DUP)
-        df = df_sorted.sort_values("_orig_order")
+        dup_key = [c for c in [USER_COL, EMAIL_COL] if c in df.columns]
+        if dup_key:
+            df_sorted = df.sort_values(["_ts", "_orig_order"], na_position="last").copy()
+            df_sorted["_flag_dup"] = df_sorted.duplicated(subset=dup_key, keep=cfg.filt.KEEP_DUP)
+            df = df_sorted.sort_values("_orig_order")
 
     # ==============================
     # Likert -> numeric
@@ -338,31 +349,41 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         if c in df.columns:
             df[c] = df[c].apply(reverse_1to5).astype(float)
 
-    # careless flags
-    k_all = len(item_cols)
-    df["_missing_rate"] = df[item_cols].isna().mean(axis=1)
-    df["_sd_items"] = df[item_cols].std(axis=1, ddof=0)
+    # 3) Careless
+    if FILTER_CARELESS:
+        k_all = len(item_cols)
+        miss_rate = df[item_cols].isna().mean(axis=1)
+        sd_items = df[item_cols].std(axis=1, ddof=0)
 
-    def max_run_length(arr) -> int:
-        v = [int(x) for x in arr if pd.notna(x)]
-        if len(v) == 0:
-            return 0
-        return max(sum(1 for _ in g) for _, g in groupby(v))
+        def max_run_length(arr) -> int:
+            v = [int(x) for x in arr if pd.notna(x)]
+            if len(v) == 0:
+                return 0
+            return max(sum(1 for _ in g) for _, g in groupby(v))
 
-    df["_longstring"] = df[item_cols].apply(lambda r: max_run_length(r.values), axis=1)
-    df["_flag_careless"] = (
-        (df["_missing_rate"] > cfg.filt.MAX_MISSING_RATE)
-        | (df["_sd_items"] <= cfg.filt.MIN_SD_ITEMS)
-        | (df["_longstring"] >= int(np.ceil(cfg.filt.LONGSTRING_PCT * k_all)))
-    )
+        longstring = df[item_cols].apply(lambda r: max_run_length(r.values), axis=1)
+
+        use_miss = bool(getattr(fcfg, "CARELESS_USE_MISSING", True))
+        use_sd = bool(getattr(fcfg, "CARELESS_USE_SD", True))
+        use_long = bool(getattr(fcfg, "CARELESS_USE_LONGSTRING", True))
+
+        cond = False
+        if use_miss:
+            cond = cond | (miss_rate > cfg.filt.MAX_MISSING_RATE)
+        if use_sd:
+            cond = cond | (sd_items <= cfg.filt.MIN_SD_ITEMS)
+        if use_long:
+            cond = cond | (longstring >= int(np.ceil(cfg.filt.LONGSTRING_PCT * k_all)))
+
+        df["_flag_careless"] = cond
 
     def join_reasons(r):
         reasons = []
-        if bool(r.get("_flag_noexp", False)):
+        if FILTER_NOEXP and bool(r.get("_flag_noexp", False)):
             reasons.append("無GenAI學習經驗")
-        if bool(r.get("_flag_dup", False)):
+        if FILTER_DUP and bool(r.get("_flag_dup", False)):
             reasons.append("重複填答")
-        if bool(r.get("_flag_careless", False)):
+        if FILTER_CARELESS and bool(r.get("_flag_careless", False)):
             reasons.append("疑似隨意/草率(缺漏/直線/長串)")
         return ";".join(reasons)
 
@@ -387,11 +408,10 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     ItemTable = item_analysis_table(cog, df_valid, groups, group_items)
     FA1Table = one_factor_fa_table(cog, df_valid, groups, group_items)
     EFA1Table, EFA1Fit = one_factor_efa_table(cog, df_valid, groups, group_items)
-
     CFA_Loadings, CFA_Info, CFA_Fit = run_cfa(cog, df_valid, groups, group_items, item_cols)
 
     # ==============================
-    # PLS main (estimation + bootstrap)
+    # PLS main (estimation + bootstrap) with config controls
     # ==============================
     PLS1_info = PLS1_outer = PLS1_quality = PLS1_htmt = PLS1_cross = pd.DataFrame()
     PLS2_info = PLS2_outer = PLS2_quality = PLS2_htmt = PLS2_cross = PLS2_commitment = pd.DataFrame()
@@ -400,7 +420,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     PLS1_BOOTPATH = PLS2_BOOTPATH = pd.DataFrame()
 
     if cfg.pls.RUN_PLS:
-        # clean-mode guards
+        # clean-mode guards (still enforce)
         scheme_up = str(getattr(cfg.pls, "PLS_SCHEME", "PATH")).strip().upper()
         if getattr(cfg.pls, "CLEAN_MODE", True):
             if scheme_up in ("CENTROID",):
@@ -425,164 +445,232 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
         Xpls = Xpls.reset_index(drop=True)
 
-        # ---- Model1 ----
-        edges1 = [
-            ("SA", "MIND"), ("SA", "ACO"), ("SA", "CCO"),
-            ("PA", "BB"), ("PA", "BS"),
-            ("BS", "MIND"), ("BS", "ACO"), ("BS", "CCO"), ("BS", "CI"),
-            ("MIND", "CI"), ("BB", "CI"), ("ACO", "CI"), ("CCO", "CI"),
-            ("CI", "LO"),
-        ]
-        lv_set1 = [g for g in ["PA", "SA", "BB", "BS", "MIND", "ACO", "CCO", "CI", "LO"] if g in groups]
-        order1 = topo_sort(lv_set1, edges1)
-        path1 = make_plspm_path(order1, edges1)
-        lv_blocks1 = {lv: group_items[lv] for lv in order1}
-        lv_modes1 = {lv: "A" for lv in order1}
+        # --------------------------
+        # Model1 (config-controlled)
+        # --------------------------
+        RUN_M1 = bool(getattr(cfg.pls, "RUN_MODEL1", True))
+        RUN_M2 = bool(getattr(cfg.pls, "RUN_MODEL2", True))
 
-        res1 = estimate_pls_basic_paper(
-            cog,
-            Xpls=Xpls,
-            item_cols=item_cols,
-            path_df=path1,
-            lv_blocks=lv_blocks1,
-            lv_modes=lv_modes1,
-            order=order1,
-        )
-        PLS1_cross = res1["PLS_cross"]
-        PLS1_outer = res1["PLS_outer"]
-        PLS1_quality = res1["PLS_quality"]
-        scores1 = res1["scores"]
+        res1 = None
+        order1 = None
+        path1 = None
+        lv_blocks1 = None
+        lv_modes1 = None
+        scores1 = None
 
-        PLS1_htmt = htmt_matrix(
-            Xpls[item_cols],
-            {g: lv_blocks1[g] for g in order1},
-            order1,
-            method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
-        )
+        if RUN_M1:
+            edges1_all = list(getattr(cfg.pls, "MODEL1_EDGES", []))
+            edges1 = [(a, b) for (a, b) in edges1_all if (a in groups) and (b in groups)]
+            nodes1 = sorted({x for e in edges1 for x in e}, key=lambda x: groups.index(x) if x in groups else 999)
 
-        PLS1_R2, PLS1_f2 = r2_f2_from_scores(scores1[order1], path1)
-        PLS1_Q2 = q2_cv_from_scores(scores1[order1], path1, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
-        PLS1_VIF = structural_vif(scores1[order1], path1)
+            if not edges1 or not nodes1:
+                PLS1_info = pd.DataFrame([{
+                    "Info": "Model1 skipped: no valid edges after intersecting with detected groups.",
+                    "profile": profile_name,
+                    "tag": tag,
+                }])
+            else:
+                order1 = topo_sort(nodes1, edges1)
+                path1 = make_plspm_path(order1, edges1)
+                lv_blocks1 = {lv: group_items[lv] for lv in order1}
+                lv_modes1 = {lv: "A" for lv in order1}
 
-        PLS1_info = pd.DataFrame([{
-            "Model": f"Model1 baseline (ACO/CCO separate) [{tag}]",
-            "profile": profile_name,
-            "order": " > ".join(order1),
-            "n(PLS)": int(Xpls.shape[0]),
-            "scheme": cfg.pls.PLS_SCHEME,
-            "missing": cfg.pls.PLS_MISSING,
-            "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
-            "B(bootstrap)": int(cfg.pls.PLS_BOOT),
-            "estimates": "outer/path from plspm model API (strict)",
-        }])
+                res1 = estimate_pls_basic_paper(
+                    cog,
+                    Xpls=Xpls,
+                    item_cols=item_cols,
+                    path_df=path1,
+                    lv_blocks=lv_blocks1,
+                    lv_modes=lv_modes1,
+                    order=order1,
+                )
 
-        # ---- Bootstrap Model1 direct paths ----
-        if int(cfg.pls.PLS_BOOT) > 0:
-            boot1 = _bootstrap_paths_single_model(
-                cog,
-                X=Xpls,
-                path_df=path1,
-                lv_blocks=lv_blocks1,
-                lv_modes=lv_modes1,
-                order=order1,
-                key_df=res1["key"],
-                anchors=res1["anchors"],
-            )
-            PLS1_BOOTPATH = summarize_direct_ci(cog, res1["key"], res1["est"], boot1)
+                PLS1_cross = res1["PLS_cross"]
+                PLS1_outer = res1["PLS_outer"]
+                PLS1_quality = res1["PLS_quality"]
+                scores1 = res1["scores"]
 
-        # ---- Model2 (two-stage Commitment formative) ----
-        can_run_m2 = ("ACO" in scores1.columns) and ("CCO" in scores1.columns) and ("ACO" in groups) and ("CCO" in groups)
-        if can_run_m2 and (not scores1[["ACO", "CCO"]].isna().any().any()):
-            edges2 = [
-                ("SA", "MIND"), ("SA", "Commitment"),
-                ("PA", "BB"), ("PA", "BS"),
-                ("BS", "MIND"), ("BS", "Commitment"), ("BS", "CI"),
-                ("MIND", "CI"), ("BB", "CI"), ("Commitment", "CI"),
-                ("CI", "LO"),
-            ]
-            lv_set2 = [g for g in ["PA", "SA", "BB", "BS", "MIND", "CI", "LO"] if g in groups] + ["Commitment"]
-            order2 = topo_sort(lv_set2, edges2)
-            path2 = make_plspm_path(order2, edges2)
+                PLS1_htmt = htmt_matrix(
+                    Xpls[item_cols],
+                    {g: lv_blocks1[g] for g in order1},
+                    order1,
+                    method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
+                )
 
-            Xpls2 = Xpls.copy()
-            Xpls2["ACO_score"] = scores1["ACO"].to_numpy()
-            Xpls2["CCO_score"] = scores1["CCO"].to_numpy()
+                PLS1_R2, PLS1_f2 = r2_f2_from_scores(scores1[order1], path1)
+                PLS1_Q2 = q2_cv_from_scores(scores1[order1], path1, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
+                PLS1_VIF = structural_vif(scores1[order1], path1)
 
-            lv_blocks2 = {}
-            for lv in order2:
-                if lv == "Commitment":
-                    lv_blocks2[lv] = ["ACO_score", "CCO_score"]
-                else:
-                    lv_blocks2[lv] = group_items[lv]
-            lv_modes2 = {lv: ("B" if lv == "Commitment" else "A") for lv in order2}
+                PLS1_info = pd.DataFrame([{
+                    "Model": f"Model1 [{tag}]",
+                    "profile": profile_name,
+                    "order": " > ".join(order1),
+                    "n(PLS)": int(Xpls.shape[0]),
+                    "scheme": cfg.pls.PLS_SCHEME,
+                    "missing": cfg.pls.PLS_MISSING,
+                    "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
+                    "B(bootstrap)": int(cfg.pls.PLS_BOOT),
+                    "estimates": "outer/path from plspm model API (strict)",
+                }])
 
-            stage2_indicators = []
-            for lv in order2:
-                stage2_indicators += lv_blocks2[lv]
-            stage2_indicators = list(dict.fromkeys(stage2_indicators))
-
-            res2 = estimate_pls_basic_paper(
-                cog,
-                Xpls=Xpls2,
-                item_cols=stage2_indicators,
-                path_df=path2,
-                lv_blocks=lv_blocks2,
-                lv_modes=lv_modes2,
-                order=order2,
-            )
-            PLS2_cross = res2["PLS_cross"]
-            PLS2_outer = res2["PLS_outer"]
-            PLS2_quality = res2["PLS_quality"]
-            scores2 = res2["scores"]
-
-            refl2 = [lv for lv in order2 if lv != "Commitment"]
-            PLS2_htmt = htmt_matrix(
-                Xpls[item_cols],
-                {g: group_items[g] for g in refl2},
-                refl2,
-                method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
-            )
-
-            PLS2_R2, PLS2_f2 = r2_f2_from_scores(scores2[order2], path2)
-            PLS2_Q2 = q2_cv_from_scores(scores2[order2], path2, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
-            PLS2_VIF = structural_vif(scores2[order2], path2)
-
-            PLS2_commitment = PLS2_outer[PLS2_outer["Construct"] == "Commitment"].copy()
-
-            PLS2_info = pd.DataFrame([{
-                "Model": f"Model2 two-stage (Commitment formative) [{tag}]",
+                if int(cfg.pls.PLS_BOOT) > 0:
+                    boot1 = _bootstrap_paths_single_model(
+                        cog,
+                        X=Xpls,
+                        path_df=path1,
+                        lv_blocks=lv_blocks1,
+                        lv_modes=lv_modes1,
+                        order=order1,
+                        key_df=res1["key"],
+                        anchors=res1["anchors"],
+                    )
+                    PLS1_BOOTPATH = summarize_direct_ci(cog, res1["key"], res1["est"], boot1)
+        else:
+            PLS1_info = pd.DataFrame([{
+                "Info": "Model1 disabled by config (RUN_MODEL1=False).",
                 "profile": profile_name,
-                "order": " > ".join(order2),
-                "n(PLS)": int(Xpls.shape[0]),
-                "scheme": cfg.pls.PLS_SCHEME,
-                "missing": cfg.pls.PLS_MISSING,
-                "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
-                "B(bootstrap)": int(cfg.pls.PLS_BOOT),
-                "estimates": "outer/path from plspm model API (strict)",
+                "tag": tag,
             }])
 
-            # ---- Bootstrap Model2 direct paths (two-stage) ----
-            if int(cfg.pls.PLS_BOOT) > 0:
-                boot2 = _bootstrap_paths_two_stage_model2(
-                    cog,
-                    X_stage1=Xpls,
-                    path1=path1,
-                    lv_blocks1=lv_blocks1,
-                    lv_modes1=lv_modes1,
-                    order1=order1,
-                    anchors1=res1["anchors"],
-                    path2=path2,
-                    lv_blocks2=lv_blocks2,
-                    lv_modes2=lv_modes2,
-                    order2=order2,
-                    anchors2=res2["anchors"],
-                    key2=res2["key"],
-                )
-                PLS2_BOOTPATH = summarize_direct_ci(cog, res2["key"], res2["est"], boot2)
+        # --------------------------
+        # Model2 (config-controlled, two-stage)
+        # --------------------------
+        if RUN_M2:
+            if res1 is None or scores1 is None or order1 is None or path1 is None:
+                PLS2_info = pd.DataFrame([{
+                    "Info": "Model2 skipped: requires Model1 results but Model1 was not run / not available.",
+                    "profile": profile_name,
+                    "tag": tag,
+                }])
+            else:
+                commitment = str(getattr(cfg.pls, "MODEL2_COMMITMENT_NAME", "Commitment"))
+                comp_lvs = list(getattr(cfg.pls, "MODEL2_COMPONENT_LVS", ["ACO", "CCO"]))
+                comp_cols = list(getattr(cfg.pls, "MODEL2_COMPONENT_COLS", ["ACO_score", "CCO_score"]))
+                if len(comp_lvs) != len(comp_cols):
+                    raise ValueError("MODEL2_COMPONENT_LVS and MODEL2_COMPONENT_COLS must have the same length.")
+                commitment_anchor = getattr(cfg.pls, "MODEL2_COMMITMENT_ANCHOR", None)
 
+                # check component LVs exist in Model1 scores
+                missing_comp = [lv for lv in comp_lvs if lv not in scores1.columns]
+                if missing_comp:
+                    PLS2_info = pd.DataFrame([{
+                        "Info": f"Model2 skipped: missing stage1 LV scores {missing_comp}.",
+                        "profile": profile_name,
+                        "tag": tag,
+                    }])
+                elif scores1[comp_lvs].isna().any().any():
+                    raise ValueError("Model2 blocked: stage1 component scores contain NaN (clean mode forbids fillna).")
+                else:
+                    edges2_all = list(getattr(cfg.pls, "MODEL2_EDGES", []))
+                    def ok_node(x: str) -> bool:
+                        return (x in groups) or (x == commitment)
+                    edges2 = [(a, b) for (a, b) in edges2_all if ok_node(a) and ok_node(b)]
+
+                    nodes2 = sorted({x for e in edges2 for x in e if x != commitment}, key=lambda x: groups.index(x) if x in groups else 999)
+                    if commitment not in nodes2:
+                        nodes2.append(commitment)
+
+                    if not edges2 or not nodes2:
+                        PLS2_info = pd.DataFrame([{
+                            "Info": "Model2 skipped: no valid edges after intersecting with detected groups + commitment.",
+                            "profile": profile_name,
+                            "tag": tag,
+                        }])
+                    else:
+                        order2 = topo_sort(nodes2, edges2)
+                        path2 = make_plspm_path(order2, edges2)
+
+                        # build stage2 X
+                        Xpls2 = Xpls.copy()
+                        for lv, col in zip(comp_lvs, comp_cols):
+                            Xpls2[col] = pd.to_numeric(scores1[lv], errors="coerce").to_numpy()
+
+                        # blocks/modes
+                        lv_blocks2 = {}
+                        for lv in order2:
+                            if lv == commitment:
+                                lv_blocks2[lv] = list(comp_cols)
+                            else:
+                                lv_blocks2[lv] = group_items[lv]
+
+                        lv_modes2 = {lv: ("B" if lv == commitment else "A") for lv in order2}
+                        lv_modes2[commitment] = str(getattr(cfg.pls, "MODEL2_COMMITMENT_MODE", "B")).upper()
+
+                        stage2_indicators = []
+                        for lv in order2:
+                            stage2_indicators += lv_blocks2[lv]
+                        stage2_indicators = list(dict.fromkeys(stage2_indicators))
+
+                        anchor_override = {commitment: commitment_anchor} if commitment_anchor else None
+
+                        res2 = estimate_pls_basic_paper(
+                            cog,
+                            Xpls=Xpls2,
+                            item_cols=stage2_indicators,
+                            path_df=path2,
+                            lv_blocks=lv_blocks2,
+                            lv_modes=lv_modes2,
+                            order=order2,
+                            anchor_overrides=anchor_override,
+                        )
+
+                        PLS2_cross = res2["PLS_cross"]
+                        PLS2_outer = res2["PLS_outer"]
+                        PLS2_quality = res2["PLS_quality"]
+                        scores2 = res2["scores"]
+
+                        refl2 = [lv for lv in order2 if lv != commitment]
+                        if refl2:
+                            PLS2_htmt = htmt_matrix(
+                                Xpls[item_cols],
+                                {g: group_items[g] for g in refl2},
+                                refl2,
+                                method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
+                            )
+
+                        PLS2_R2, PLS2_f2 = r2_f2_from_scores(scores2[order2], path2)
+                        PLS2_Q2 = q2_cv_from_scores(scores2[order2], path2, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
+                        PLS2_VIF = structural_vif(scores2[order2], path2)
+
+                        PLS2_commitment = PLS2_outer[PLS2_outer["Construct"] == commitment].copy()
+
+                        PLS2_info = pd.DataFrame([{
+                            "Model": f"Model2 [{tag}]",
+                            "profile": profile_name,
+                            "order": " > ".join(order2),
+                            "n(PLS)": int(Xpls.shape[0]),
+                            "scheme": cfg.pls.PLS_SCHEME,
+                            "missing": cfg.pls.PLS_MISSING,
+                            "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
+                            "B(bootstrap)": int(cfg.pls.PLS_BOOT),
+                            "commitment": commitment,
+                            "components": ",".join(comp_lvs),
+                            "estimates": "outer/path from plspm model API (strict)",
+                        }])
+
+                        if int(cfg.pls.PLS_BOOT) > 0:
+                            boot2 = _bootstrap_paths_two_stage_model2(
+                                cog,
+                                X_stage1=Xpls,
+                                path1=path1,
+                                lv_blocks1=lv_blocks1,
+                                lv_modes1=lv_modes1,
+                                order1=order1,
+                                anchors1=res1["anchors"],
+                                commitment_name=commitment,
+                                comp_lvs=comp_lvs,
+                                comp_cols=comp_cols,
+                                path2=path2,
+                                lv_blocks2=lv_blocks2,
+                                lv_modes2=lv_modes2,
+                                order2=order2,
+                                anchors2=res2["anchors"],
+                                key2=res2["key"],
+                            )
+                            PLS2_BOOTPATH = summarize_direct_ci(cog, res2["key"], res2["est"], boot2)
         else:
             PLS2_info = pd.DataFrame([{
-                "Info": "Model2 skipped (needs ACO/CCO constructs and non-missing ACO/CCO scores).",
+                "Info": "Model2 disabled by config (RUN_MODEL2=False).",
                 "profile": profile_name,
                 "tag": tag,
             }])
@@ -634,7 +722,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             ws_pls = get_or_create_ws(writer, cfg.io.PLS_SHEET)
             rp = 0
 
-            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "MODEL 1 (Baseline): ACO / CCO separate", PLS1_info, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "MODEL 1", PLS1_info, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-A. Outer model (model API)", PLS1_outer, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-B. CR / AVE", PLS1_quality, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-C. HTMT", PLS1_htmt, index=True)
@@ -647,7 +735,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
             rp += 2
 
-            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "MODEL 2 (Main): Commitment(formative) two-stage", PLS2_info, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "MODEL 2", PLS2_info, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-A. Commitment outer (model API)", PLS2_commitment, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-B. Outer model (model API)", PLS2_outer, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-C. CR / AVE", PLS2_quality, index=False)
