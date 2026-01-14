@@ -263,7 +263,11 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         EXP_COL = rename_map.get(EXP_COL, EXP_COL)
 
     SCALES = list(scale_prefixes) if scale_prefixes else list(cfg.scales.SCALES)
+    EXP_COL_EXPER = "使用AI工具來學習之經驗"
+    EXP_COL_FREQ  = "使用AI工具來學習之頻率"
 
+    if EXP_COL in df.columns and ("頻率" in str(EXP_COL)) and (EXP_COL_EXPER in df.columns):
+    EXP_COL = EXP_COL_EXPER
     # ==============================
     # Find item columns (after rename)
     # ==============================
