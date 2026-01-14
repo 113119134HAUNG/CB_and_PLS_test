@@ -51,10 +51,17 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     # ==============================
     resolved_cols, profile_name, scale_prefixes, rename_map = resolve_schema(df, cfg, cog)
 
-    # Rename item columns -> token (e.g., "SRL3 我會..." -> "SRL3")
-    # 注意：只 rename 題項欄位；meta 欄位通常不會被匹配到
+    # Rename item columns -> token
     if rename_map:
         df = df.rename(columns=rename_map)
+
+        # ✅ 防呆：rename 後不能有重複欄名
+        if df.columns.duplicated().any():
+            dups = df.columns[df.columns.duplicated()].tolist()
+            raise ValueError(
+                f"Duplicate columns after rename_map. Duplicates={dups}. "
+                "This usually means multiple original columns mapped to the same token."
+            )
 
     # Meta columns (prefer resolved; fallback to cfg.cols.*)
     TS_COL = resolved_cols.get("TS_COL", cfg.cols.TS_COL)
@@ -62,13 +69,19 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     EMAIL_COL = resolved_cols.get("EMAIL_COL", cfg.cols.EMAIL_COL)
     EXP_COL = resolved_cols.get("EXP_COL", cfg.cols.EXP_COL)
 
+    # ✅ 防呆：若 rename_map 也改到了 meta 欄（通常不會，但保險）
+    if rename_map:
+        TS_COL = rename_map.get(TS_COL, TS_COL)
+        USER_COL = rename_map.get(USER_COL, USER_COL)
+        EMAIL_COL = rename_map.get(EMAIL_COL, EMAIL_COL)
+        EXP_COL = rename_map.get(EXP_COL, EXP_COL)
+
     # Scales (prefer detected profile; fallback to cfg.scales.SCALES)
     SCALES = list(scale_prefixes) if scale_prefixes else list(cfg.scales.SCALES)
 
     # ==============================
     # Find item columns (after rename)
     # ==============================
-    # token pattern: (PREFIX)(digits 1~2) is enough for v1/v2; v3 is A/B/C + 2 digits (still matches \d{1,2})
     scale_alt = "|".join(map(re.escape, SCALES))
     item_pat = re.compile(rf"^(?:{scale_alt})\d{{1,2}}$")
 
@@ -285,77 +298,81 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         }])
 
         # ---- Model2 (two-stage Commitment formative) ----
-        edges2 = [
-            ("SA", "MIND"), ("SA", "Commitment"),
-            ("PA", "BB"), ("PA", "BS"),
-            ("BS", "MIND"), ("BS", "Commitment"), ("BS", "CI"),
-            ("MIND", "CI"), ("BB", "CI"), ("Commitment", "CI"),
-            ("CI", "LO"),
-        ]
-        lv_set2 = [g for g in ["PA", "SA", "BB", "BS", "MIND", "CI", "LO"] if g in groups] + ["Commitment"]
-        order2 = topo_sort(lv_set2, edges2)
-        path2 = make_plspm_path(order2, edges2)
+        # ✅ 更穩：若缺 ACO/CCO，直接跳過 Model2
+        can_run_m2 = ("ACO" in scores1.columns) and ("CCO" in scores1.columns) and ("ACO" in groups) and ("CCO" in groups)
+        if can_run_m2 and (not scores1[["ACO", "CCO"]].isna().any().any()):
+            edges2 = [
+                ("SA", "MIND"), ("SA", "Commitment"),
+                ("PA", "BB"), ("PA", "BS"),
+                ("BS", "MIND"), ("BS", "Commitment"), ("BS", "CI"),
+                ("MIND", "CI"), ("BB", "CI"), ("Commitment", "CI"),
+                ("CI", "LO"),
+            ]
+            lv_set2 = [g for g in ["PA", "SA", "BB", "BS", "MIND", "CI", "LO"] if g in groups] + ["Commitment"]
+            order2 = topo_sort(lv_set2, edges2)
+            path2 = make_plspm_path(order2, edges2)
 
-        if ("ACO" not in scores1.columns) or ("CCO" not in scores1.columns):
-            raise KeyError("Model2 requires ACO and CCO scores from Model1.")
-        if scores1[["ACO", "CCO"]].isna().any().any():
-            raise ValueError("Stage1 ACO/CCO scores contain NaN. Clean mode forbids fillna(mean).")
+            Xpls2 = Xpls.copy()
+            Xpls2["ACO_score"] = scores1["ACO"].to_numpy()
+            Xpls2["CCO_score"] = scores1["CCO"].to_numpy()
 
-        Xpls2 = Xpls.copy()
-        Xpls2["ACO_score"] = scores1["ACO"].to_numpy()
-        Xpls2["CCO_score"] = scores1["CCO"].to_numpy()
+            lv_blocks2 = {}
+            for lv in order2:
+                if lv == "Commitment":
+                    lv_blocks2[lv] = ["ACO_score", "CCO_score"]
+                else:
+                    lv_blocks2[lv] = group_items[lv]
+            lv_modes2 = {lv: ("B" if lv == "Commitment" else "A") for lv in order2}
 
-        lv_blocks2 = {}
-        for lv in order2:
-            if lv == "Commitment":
-                lv_blocks2[lv] = ["ACO_score", "CCO_score"]
-            else:
-                lv_blocks2[lv] = group_items[lv]
-        lv_modes2 = {lv: ("B" if lv == "Commitment" else "A") for lv in order2}
+            stage2_indicators = []
+            for lv in order2:
+                stage2_indicators += lv_blocks2[lv]
+            stage2_indicators = list(dict.fromkeys(stage2_indicators))
 
-        stage2_indicators = []
-        for lv in order2:
-            stage2_indicators += lv_blocks2[lv]
-        stage2_indicators = list(dict.fromkeys(stage2_indicators))
+            res2 = estimate_pls_basic_paper(
+                cog,
+                Xpls=Xpls2,
+                item_cols=stage2_indicators,
+                path_df=path2,
+                lv_blocks=lv_blocks2,
+                lv_modes=lv_modes2,
+                order=order2,
+            )
+            PLS2_cross = res2["PLS_cross"]
+            PLS2_outer = res2["PLS_outer"]
+            PLS2_quality = res2["PLS_quality"]
+            scores2 = res2["scores"]
 
-        res2 = estimate_pls_basic_paper(
-            cog,
-            Xpls=Xpls2,
-            item_cols=stage2_indicators,
-            path_df=path2,
-            lv_blocks=lv_blocks2,
-            lv_modes=lv_modes2,
-            order=order2,
-        )
-        PLS2_cross = res2["PLS_cross"]
-        PLS2_outer = res2["PLS_outer"]
-        PLS2_quality = res2["PLS_quality"]
-        scores2 = res2["scores"]
+            refl2 = [lv for lv in order2 if lv != "Commitment"]
+            PLS2_htmt = htmt_matrix(
+                Xpls[item_cols],
+                {g: group_items[g] for g in refl2},
+                refl2,
+                method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
+            )
 
-        refl2 = [lv for lv in order2 if lv != "Commitment"]
-        PLS2_htmt = htmt_matrix(
-            Xpls[item_cols],
-            {g: group_items[g] for g in refl2},
-            refl2,
-            method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
-        )
+            PLS2_R2, PLS2_f2 = r2_f2_from_scores(scores2[order2], path2)
+            PLS2_Q2 = q2_cv_from_scores(scores2[order2], path2, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
+            PLS2_VIF = structural_vif(scores2[order2], path2)
 
-        PLS2_R2, PLS2_f2 = r2_f2_from_scores(scores2[order2], path2)
-        PLS2_Q2 = q2_cv_from_scores(scores2[order2], path2, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
-        PLS2_VIF = structural_vif(scores2[order2], path2)
+            PLS2_commitment = PLS2_outer[PLS2_outer["Construct"] == "Commitment"].copy()
 
-        PLS2_commitment = PLS2_outer[PLS2_outer["Construct"] == "Commitment"].copy()
-
-        PLS2_info = pd.DataFrame([{
-            "Model": f"Model2 two-stage (Commitment formative) [{tag}]",
-            "profile": profile_name,
-            "order": " > ".join(order2),
-            "n(PLS)": int(Xpls.shape[0]),
-            "scheme": cfg.pls.PLS_SCHEME,
-            "missing": cfg.pls.PLS_MISSING,
-            "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
-            "estimates": "outer/path from plspm model API (strict)",
-        }])
+            PLS2_info = pd.DataFrame([{
+                "Model": f"Model2 two-stage (Commitment formative) [{tag}]",
+                "profile": profile_name,
+                "order": " > ".join(order2),
+                "n(PLS)": int(Xpls.shape[0]),
+                "scheme": cfg.pls.PLS_SCHEME,
+                "missing": cfg.pls.PLS_MISSING,
+                "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
+                "estimates": "outer/path from plspm model API (strict)",
+            }])
+        else:
+            PLS2_info = pd.DataFrame([{
+                "Info": "Model2 skipped (needs ACO/CCO constructs and non-missing ACO/CCO scores).",
+                "profile": profile_name,
+                "tag": tag,
+            }])
 
         # Bootstrap direct paths (目前留空；你若之後做 bootstrap loop 再填)
         PLS1_BOOTPATH = pd.DataFrame()
