@@ -68,6 +68,14 @@ class PLSConfig:
     PLSPM_MAX_ITER: int = 3000         # SmartPLS4 對齊
     PLSPM_TOL: float = 1e-7            # SmartPLS4 對齊
 
+    # clean / paper output
+    SIGN_FIX: bool = True
+    PAPER_DECIMALS: int = 3
+
+    # bootstrap CI (paper)
+    BOOT_CI_LO: float = 0.025
+    BOOT_CI_HI: float = 0.975
+
     # ---- Missing handling ----
     # clean 建議用 "none"（資料先處理好）或 "listwise"（刪掉含缺值列，不生成新數值）
     # 如果你自己明確想用 mean replacement，才設 "mean"
