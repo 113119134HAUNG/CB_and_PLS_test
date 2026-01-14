@@ -7,6 +7,7 @@ from itertools import groupby
 import numpy as np
 import pandas as pd
 
+from pls_project.schema import resolve_schema
 from pls_project.io_utils import to_score, reverse_1to5, get_or_create_ws, write_block
 from pls_project.paper import (
     reliability_summary,
@@ -24,54 +25,87 @@ from pls_project.pls_core import (
     structural_vif,
 )
 from pls_project.pls_estimate import estimate_pls_basic_paper
-from pls_project.pls_bootstrap import summarize_direct_ci
+
+# 若你之後有做 bootstrap loop，再把 summarize_direct_ci 用起來
+# from pls_project.pls_bootstrap import summarize_direct_ci
 
 
 def run_pipeline(cog, reverse_target: bool, tag: str):
     cfg = cog.cfg
     OUT_XLSX = f"{cfg.io.OUT_XLSX_BASE}_{tag}.xlsx"
-    OUT_CSV  = f"{cfg.io.OUT_CSV_BASE}_{tag}.csv"
+    OUT_CSV = f"{cfg.io.OUT_CSV_BASE}_{tag}.csv"
 
     print("\n" + "=" * 80)
     print(f"🚀 Running scenario: {tag} | reverse_{cfg.scenario.SCENARIO_TARGET}={reverse_target}")
     print("=" * 80)
 
+    # ==============================
+    # Load
+    # ==============================
     df = pd.read_excel(cfg.io.XLSX_PATH, sheet_name=cfg.io.SHEET_NAME)
     df.columns = df.columns.astype(str).str.strip()
     print("Data shape:", df.shape)
 
-    # find item columns
-    SCALES = list(cfg.scales.SCALES)
-    scale_alt = "|".join(SCALES)
-    item_pat = re.compile(rf"^(?:{scale_alt})\d{{1,2}}$")
-    item_cols = [c for c in df.columns if item_pat.fullmatch(str(c))]
+    # ==============================
+    # Schema resolve (profile/meta/rename_map)
+    # ==============================
+    resolved_cols, profile_name, scale_prefixes, rename_map = resolve_schema(df, cfg, cog)
 
-    def sort_key(c):
+    # Rename item columns -> token (e.g., "SRL3 我會..." -> "SRL3")
+    # 注意：只 rename 題項欄位；meta 欄位通常不會被匹配到
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # Meta columns (prefer resolved; fallback to cfg.cols.*)
+    TS_COL = resolved_cols.get("TS_COL", cfg.cols.TS_COL)
+    USER_COL = resolved_cols.get("USER_COL", cfg.cols.USER_COL)
+    EMAIL_COL = resolved_cols.get("EMAIL_COL", cfg.cols.EMAIL_COL)
+    EXP_COL = resolved_cols.get("EXP_COL", cfg.cols.EXP_COL)
+
+    # Scales (prefer detected profile; fallback to cfg.scales.SCALES)
+    SCALES = list(scale_prefixes) if scale_prefixes else list(cfg.scales.SCALES)
+
+    # ==============================
+    # Find item columns (after rename)
+    # ==============================
+    # token pattern: (PREFIX)(digits 1~2) is enough for v1/v2; v3 is A/B/C + 2 digits (still matches \d{1,2})
+    scale_alt = "|".join(map(re.escape, SCALES))
+    item_pat = re.compile(rf"^(?:{scale_alt})\d{{1,2}}$")
+
+    item_cols = [c for c in df.columns if item_pat.fullmatch(str(c))]
+    if not item_cols:
+        raise ValueError(
+            f"找不到題項欄位！"
+            f"目前 profile={profile_name}, prefixes={SCALES}. "
+            f"請確認欄名是否已被 schema rename 成 token（如 PA1 / SRL3 / A11）。"
+        )
+
+    def sort_key(c: str):
         m = re.match(r"^([A-Z]+)(\d+)$", str(c))
-        return (SCALES.index(m.group(1)) if m and m.group(1) in SCALES else 999, int(m.group(2)) if m else 999)
+        if not m:
+            return (999, 999)
+        prefix, num = m.group(1), int(m.group(2))
+        return (SCALES.index(prefix) if prefix in SCALES else 999, num)
 
     item_cols = sorted(item_cols, key=sort_key)
-    if not item_cols:
-        raise ValueError("找不到題項欄位！請確認欄名是否為 PA1/BS1/.../LO6。")
 
     groups = [g for g in SCALES if any(col.startswith(g) for col in item_cols)]
     group_items = {g: [c for c in item_cols if c.startswith(g)] for g in groups}
+    print("Profile:", profile_name)
     print("Groups:", groups)
 
-    # reverse list
+    # ==============================
+    # Reverse list
+    # ==============================
     REVERSE_ITEMS = list(cfg.scales.BASE_REVERSE_ITEMS)
-    if reverse_target and cfg.scenario.SCENARIO_TARGET in group_items:
+    if reverse_target and (cfg.scenario.SCENARIO_TARGET in group_items):
         REVERSE_ITEMS += list(group_items[cfg.scenario.SCENARIO_TARGET])
 
-    # flags
+    # ==============================
+    # Flags (experience / duplication / careless)
+    # ==============================
     df["_flag_noexp"] = False
     df["_flag_dup"] = False
-
-    # experience column
-    EXP_COL = cfg.cols.EXP_COL
-    TS_COL = cfg.cols.TS_COL
-    USER_COL = cfg.cols.USER_COL
-    EMAIL_COL = cfg.cols.EMAIL_COL
 
     def has_experience(x) -> bool:
         if pd.isna(x):
@@ -90,6 +124,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     if EXP_COL in df.columns:
         df["_flag_noexp"] = ~df[EXP_COL].apply(has_experience)
 
+    # timestamp for duplicate resolution
     df["_ts"] = pd.to_datetime(df[TS_COL], errors="coerce") if TS_COL in df.columns else pd.NaT
     df["_orig_order"] = np.arange(len(df))
 
@@ -99,7 +134,9 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         df_sorted["_flag_dup"] = df_sorted.duplicated(subset=dup_key, keep=cfg.filt.KEEP_DUP)
         df = df_sorted.sort_values("_orig_order")
 
-    # likert -> numeric
+    # ==============================
+    # Likert -> numeric
+    # ==============================
     for c in item_cols:
         df[c] = df[c].apply(to_score).astype(float)
 
@@ -121,12 +158,11 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
     df["_longstring"] = df[item_cols].apply(lambda r: max_run_length(r.values), axis=1)
     df["_flag_careless"] = (
-        (df["_missing_rate"] > cfg.filt.MAX_MISSING_RATE) |
-        (df["_sd_items"] <= cfg.filt.MIN_SD_ITEMS) |
-        (df["_longstring"] >= int(np.ceil(cfg.filt.LONGSTRING_PCT * k_all)))
+        (df["_missing_rate"] > cfg.filt.MAX_MISSING_RATE)
+        | (df["_sd_items"] <= cfg.filt.MIN_SD_ITEMS)
+        | (df["_longstring"] >= int(np.ceil(cfg.filt.LONGSTRING_PCT * k_all)))
     )
 
-    # build exclusion reason
     def join_reasons(r):
         reasons = []
         if bool(r.get("_flag_noexp", False)):
@@ -151,7 +187,9 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
     df_valid = df_valid.drop(columns=[c for c in df_valid.columns if c.startswith("_")], errors="ignore")
 
+    # ==============================
     # Paper tables
+    # ==============================
     RelTable = reliability_summary(cog, df_valid, groups, group_items, item_cols)
     ItemTable = item_analysis_table(cog, df_valid, groups, group_items)
     FA1Table = one_factor_fa_table(cog, df_valid, groups, group_items)
@@ -170,16 +208,26 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     PLS1_BOOTPATH = PLS2_BOOTPATH = pd.DataFrame()
 
     if cfg.pls.RUN_PLS:
+        # clean-mode guards
+        scheme_up = str(getattr(cfg.pls, "PLS_SCHEME", "PATH")).strip().upper()
+        if getattr(cfg.pls, "CLEAN_MODE", True):
+            if scheme_up in ("CENTROID",):
+                raise ValueError("CLEAN_MODE=True forbids PLS_SCHEME='CENTROID' (SmartPLS4 removed it).")
+            if (scheme_up == "PCA") and (not bool(getattr(cfg.pls, "ALLOW_PCA", False))):
+                raise ValueError("CLEAN_MODE=True and ALLOW_PCA=False forbids PLS_SCHEME='PCA' approximation.")
+            if str(getattr(cfg.pls, "PLS_MISSING", "listwise")).lower() == "mean":
+                raise ValueError("CLEAN_MODE=True forbids PLS_MISSING='mean' (generates new values).")
+
         Xpls = df_valid[item_cols].copy().astype(float)
 
         # missing handling (config-driven)
-        if cfg.pls.PLS_MISSING == "none":
+        miss = str(getattr(cfg.pls, "PLS_MISSING", "listwise")).lower()
+        if miss == "none":
             if Xpls.isna().any().any():
                 raise ValueError("PLS_MISSING='none' but missing values exist. Handle missing before import.")
-        elif cfg.pls.PLS_MISSING == "listwise":
+        elif miss == "listwise":
             Xpls = Xpls.dropna()
-        elif cfg.pls.PLS_MISSING == "mean":
-            # 這會生成新值；若你要完全乾淨請改成 none/listwise
+        elif miss == "mean":
             Xpls = Xpls.apply(lambda s: s.fillna(s.mean()), axis=0)
         else:
             raise ValueError(f"Unknown PLS_MISSING: {cfg.pls.PLS_MISSING}")
@@ -214,7 +262,12 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         PLS1_quality = res1["PLS_quality"]
         scores1 = res1["scores"]
 
-        PLS1_htmt = htmt_matrix(Xpls[item_cols], {g: lv_blocks1[g] for g in order1}, order1, method=cfg.pls.HTMT_CORR_METHOD)
+        PLS1_htmt = htmt_matrix(
+            Xpls[item_cols],
+            {g: lv_blocks1[g] for g in order1},
+            order1,
+            method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
+        )
 
         PLS1_R2, PLS1_f2 = r2_f2_from_scores(scores1[order1], path1)
         PLS1_Q2 = q2_cv_from_scores(scores1[order1], path1, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
@@ -222,12 +275,13 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
         PLS1_info = pd.DataFrame([{
             "Model": f"Model1 baseline (ACO/CCO separate) [{tag}]",
+            "profile": profile_name,
             "order": " > ".join(order1),
             "n(PLS)": int(Xpls.shape[0]),
             "scheme": cfg.pls.PLS_SCHEME,
             "missing": cfg.pls.PLS_MISSING,
             "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
-            "estimates": "outer/path from plspm model API (strict)"
+            "estimates": "outer/path from plspm model API (strict)",
         }])
 
         # ---- Model2 (two-stage Commitment formative) ----
@@ -279,7 +333,12 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         scores2 = res2["scores"]
 
         refl2 = [lv for lv in order2 if lv != "Commitment"]
-        PLS2_htmt = htmt_matrix(Xpls[item_cols], {g: group_items[g] for g in refl2}, refl2, method=cfg.pls.HTMT_CORR_METHOD)
+        PLS2_htmt = htmt_matrix(
+            Xpls[item_cols],
+            {g: group_items[g] for g in refl2},
+            refl2,
+            method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
+        )
 
         PLS2_R2, PLS2_f2 = r2_f2_from_scores(scores2[order2], path2)
         PLS2_Q2 = q2_cv_from_scores(scores2[order2], path2, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
@@ -289,16 +348,16 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
         PLS2_info = pd.DataFrame([{
             "Model": f"Model2 two-stage (Commitment formative) [{tag}]",
+            "profile": profile_name,
             "order": " > ".join(order2),
             "n(PLS)": int(Xpls.shape[0]),
             "scheme": cfg.pls.PLS_SCHEME,
             "missing": cfg.pls.PLS_MISSING,
             "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
-            "estimates": "outer/path from plspm model API (strict)"
+            "estimates": "outer/path from plspm model API (strict)",
         }])
 
-        # Optional: Bootstrap direct paths (if you already generate boot arrays elsewhere)
-        # Here left empty unless you implement full bootstrap loop.
+        # Bootstrap direct paths (目前留空；你若之後做 bootstrap loop 再填)
         PLS1_BOOTPATH = pd.DataFrame()
         PLS2_BOOTPATH = pd.DataFrame()
 
@@ -312,18 +371,34 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         ws = get_or_create_ws(writer, cfg.io.PAPER_SHEET)
         r = 0
         r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"A. Reliability summary (α / ωt) [{tag}]", RelTable, index=False)
-        r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"B. Item analysis (all constructs stacked) [{tag}]",
-                        ItemTable[["Construct","Item","n(complete)","Mean","SD","CITC","α if deleted","ωt if deleted"]], index=False)
-        r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"C. One-factor loadings (sklearn FA, all constructs stacked) [{tag}]",
-                        FA1Table[["Construct","Item","n(complete)","Loading","h2","psi"]], index=False)
-        r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"D. One-factor EFA per construct (factor_analyzer, all constructs stacked) [{tag}]",
-                        EFA1Table[["Construct","Item","n(complete)","EFA Loading","h2","psi"]], index=False)
+        r = write_block(
+            writer, cfg.io.PAPER_SHEET, ws, r,
+            f"B. Item analysis (all constructs stacked) [{tag}]",
+            ItemTable[["Construct", "Item", "n(complete)", "Mean", "SD", "CITC", "α if deleted", "ωt if deleted"]],
+            index=False,
+        )
+        r = write_block(
+            writer, cfg.io.PAPER_SHEET, ws, r,
+            f"C. One-factor loadings (sklearn FA, all constructs stacked) [{tag}]",
+            FA1Table[["Construct", "Item", "n(complete)", "Loading", "h2", "psi"]],
+            index=False,
+        )
+        r = write_block(
+            writer, cfg.io.PAPER_SHEET, ws, r,
+            f"D. One-factor EFA per construct (factor_analyzer, all constructs stacked) [{tag}]",
+            EFA1Table[["Construct", "Item", "n(complete)", "EFA Loading", "h2", "psi"]],
+            index=False,
+        )
         if EFA1Fit is not None and (not EFA1Fit.empty):
-            r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"D-2. EFA suitability (KMO / Bartlett) per construct [{tag}]",
-                            EFA1Fit[["Construct","n(complete)","k(items)","KMO","Bartlett_p"]], index=False)
+            r = write_block(
+                writer, cfg.io.PAPER_SHEET, ws, r,
+                f"D-2. EFA suitability (KMO / Bartlett) per construct [{tag}]",
+                EFA1Fit[["Construct", "n(complete)", "k(items)", "KMO", "Bartlett_p"]],
+                index=False,
+            )
 
         if cfg.cfa.RUN_CFA:
-            r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"E. CFA standardized loadings (all constructs together) [{tag}]", CFA_Loadings, index=False)
+            r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"E. CFA standardized loadings [{tag}]", CFA_Loadings, index=False)
             r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"F. CFA model info [{tag}]", CFA_Info, index=False)
             r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"G. CFA fit indices [{tag}]", CFA_Fit, index=False)
 
