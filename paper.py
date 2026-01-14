@@ -1,11 +1,18 @@
 # pls_project/paper.py
 from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 
 from sklearn.decomposition import FactorAnalysis
 from factor_analyzer import FactorAnalyzer
 from factor_analyzer.factor_analyzer import calculate_kmo, calculate_bartlett_sphericity
+
+
+def _decimals_from_cfg(cog) -> int:
+    if not hasattr(cog.cfg.pls, "PAPER_DECIMALS"):
+        raise AttributeError("Config.pls must define PAPER_DECIMALS (clean mode).")
+    return int(cog.cfg.pls.PAPER_DECIMALS)
 
 
 def cronbach_alpha(items_df: pd.DataFrame) -> float:
@@ -22,6 +29,10 @@ def cronbach_alpha(items_df: pd.DataFrame) -> float:
 
 
 def mcdonald_omega_total(items_df: pd.DataFrame, seed: int = 0) -> float:
+    """
+    Omega total via 1-factor FA on standardized items.
+    Clean: no clipping constants. If uniqueness invalid -> NaN.
+    """
     X = items_df.dropna().astype(float)
     k = X.shape[1]
     n = X.shape[0]
@@ -31,11 +42,16 @@ def mcdonald_omega_total(items_df: pd.DataFrame, seed: int = 0) -> float:
     if (sd == 0).any():
         return np.nan
     Z = (X - X.mean()) / sd
+
     try:
         fa = FactorAnalysis(n_components=1, random_state=seed)
         fa.fit(Z.values)
         loadings = fa.components_.T[:, 0]
-        uniq = np.clip(fa.noise_variance_.astype(float), 1e-8, None)
+        uniq = fa.noise_variance_.astype(float)
+
+        if np.any(~np.isfinite(uniq)) or np.any(uniq <= 0):
+            return np.nan
+
         lam = np.abs(loadings)
         return float((lam.sum() ** 2) / ((lam.sum() ** 2) + uniq.sum()))
     except Exception:
@@ -43,7 +59,9 @@ def mcdonald_omega_total(items_df: pd.DataFrame, seed: int = 0) -> float:
 
 
 def reliability_summary(cog, df_valid: pd.DataFrame, groups, group_items, item_cols) -> pd.DataFrame:
-    seed = cog.cfg.pls.PLS_SEED
+    seed = int(cog.cfg.pls.PLS_SEED)
+    dec = _decimals_from_cfg(cog)
+
     rows = []
     for g in groups:
         cols = group_items[g]
@@ -62,12 +80,14 @@ def reliability_summary(cog, df_valid: pd.DataFrame, groups, group_items, item_c
         "McDonald ωt": mcdonald_omega_total(df_valid[item_cols], seed=seed)
     })
     out = pd.DataFrame(rows)
-    out[["Cronbach α","McDonald ωt"]] = out[["Cronbach α","McDonald ωt"]].round(3)
+    out[["Cronbach α", "McDonald ωt"]] = out[["Cronbach α", "McDonald ωt"]].round(dec)
     return out
 
 
 def item_analysis_table(cog, df_valid: pd.DataFrame, groups, group_items) -> pd.DataFrame:
-    seed = cog.cfg.pls.PLS_SEED
+    seed = int(cog.cfg.pls.PLS_SEED)
+    dec = _decimals_from_cfg(cog)
+
     rows = []
     for g in groups:
         X = df_valid[group_items[g]].dropna().astype(float)
@@ -92,12 +112,16 @@ def item_analysis_table(cog, df_valid: pd.DataFrame, groups, group_items) -> pd.
             })
     out = pd.DataFrame(rows)
     if not out.empty:
-        out[["Mean","SD","CITC","α if deleted","ωt if deleted"]] = out[["Mean","SD","CITC","α if deleted","ωt if deleted"]].round(3)
+        out[["Mean", "SD", "CITC", "α if deleted", "ωt if deleted"]] = out[
+            ["Mean", "SD", "CITC", "α if deleted", "ωt if deleted"]
+        ].round(dec)
     return out
 
 
 def one_factor_fa_table(cog, df_valid: pd.DataFrame, groups, group_items) -> pd.DataFrame:
-    seed = cog.cfg.pls.PLS_SEED
+    seed = int(cog.cfg.pls.PLS_SEED)
+    dec = _decimals_from_cfg(cog)
+
     rows = []
     for g in groups:
         X = df_valid[group_items[g]].dropna().astype(float)
@@ -115,17 +139,21 @@ def one_factor_fa_table(cog, df_valid: pd.DataFrame, groups, group_items) -> pd.
         if np.nansum(lam) < 0:
             lam = -lam
         psi = fa.noise_variance_.astype(float)
-        h2 = lam**2
+        h2 = lam ** 2
         for i, it in enumerate(X.columns):
-            rows.append({"Construct": g, "Item": it, "n(complete)": int(n),
-                         "Loading": float(lam[i]), "h2": float(h2[i]), "psi": float(psi[i])})
+            rows.append({
+                "Construct": g, "Item": it, "n(complete)": int(n),
+                "Loading": float(lam[i]), "h2": float(h2[i]), "psi": float(psi[i])
+            })
     out = pd.DataFrame(rows)
     if not out.empty:
-        out[["Loading","h2","psi"]] = out[["Loading","h2","psi"]].round(3)
+        out[["Loading", "h2", "psi"]] = out[["Loading", "h2", "psi"]].round(dec)
     return out
 
 
 def one_factor_efa_table(cog, df_valid: pd.DataFrame, groups, group_items):
+    dec = _decimals_from_cfg(cog)
+
     rows, fit_rows = [], []
     for g in groups:
         X = df_valid[group_items[g]].dropna().astype(float)
@@ -133,6 +161,7 @@ def one_factor_efa_table(cog, df_valid: pd.DataFrame, groups, group_items):
         n = X.shape[0]
         if k < 3 or n < 5:
             continue
+
         try:
             _, kmo_model = calculate_kmo(X)
             _, bart_p = calculate_bartlett_sphericity(X)
@@ -148,27 +177,30 @@ def one_factor_efa_table(cog, df_valid: pd.DataFrame, groups, group_items):
             h2 = fa.get_communalities()
             psi = fa.get_uniquenesses()
         except Exception:
-            # 若 EFA 不穩，至少回傳 fit row
             L = np.full(k, np.nan)
             h2 = np.full(k, np.nan)
             psi = np.full(k, np.nan)
 
-        fit_rows.append({"Construct": g, "n(complete)": int(n), "k(items)": int(k),
-                         "KMO": float(kmo_model) if pd.notna(kmo_model) else np.nan,
-                         "Bartlett_p": float(bart_p) if pd.notna(bart_p) else np.nan})
+        fit_rows.append({
+            "Construct": g, "n(complete)": int(n), "k(items)": int(k),
+            "KMO": float(kmo_model) if pd.notna(kmo_model) else np.nan,
+            "Bartlett_p": float(bart_p) if pd.notna(bart_p) else np.nan
+        })
 
         for i, it in enumerate(X.columns):
-            rows.append({"Construct": g, "Item": it, "n(complete)": int(n),
-                         "EFA Loading": float(L[i]) if np.isfinite(L[i]) else np.nan,
-                         "h2": float(h2[i]) if np.isfinite(h2[i]) else np.nan,
-                         "psi": float(psi[i]) if np.isfinite(psi[i]) else np.nan})
+            rows.append({
+                "Construct": g, "Item": it, "n(complete)": int(n),
+                "EFA Loading": float(L[i]) if np.isfinite(L[i]) else np.nan,
+                "h2": float(h2[i]) if np.isfinite(h2[i]) else np.nan,
+                "psi": float(psi[i]) if np.isfinite(psi[i]) else np.nan
+            })
 
     out = pd.DataFrame(rows)
     fit = pd.DataFrame(fit_rows)
     if not out.empty:
-        out[["EFA Loading","h2","psi"]] = out[["EFA Loading","h2","psi"]].round(3)
+        out[["EFA Loading", "h2", "psi"]] = out[["EFA Loading", "h2", "psi"]].round(dec)
     if not fit.empty:
-        fit[["KMO","Bartlett_p"]] = fit[["KMO","Bartlett_p"]].round(3)
+        fit[["KMO", "Bartlett_p"]] = fit[["KMO", "Bartlett_p"]].round(dec)
     return out, fit
 
 
@@ -177,7 +209,8 @@ def run_cfa(cog, df_valid, groups, group_items, item_cols):
     if not cfg.RUN_CFA:
         return (pd.DataFrame([{"RUN_CFA": False}]), pd.DataFrame(), pd.DataFrame())
 
-    # 把安裝移到 pipeline/deps；這裡只 import
+    dec = _decimals_from_cfg(cog)
+
     try:
         from semopy import Model, calc_stats
     except Exception as e:
@@ -189,6 +222,7 @@ def run_cfa(cog, df_valid, groups, group_items, item_cols):
 
     Xcfa = df_valid[item_cols].copy().astype(float)
     if cfg.CFA_MISSING == "mean":
+        # 這會生成新值；若你要完全乾淨請在 Config 設 listwise/none
         Xcfa = Xcfa.apply(lambda s: s.fillna(s.mean()), axis=0)
     else:
         Xcfa = Xcfa.dropna()
@@ -208,27 +242,27 @@ def run_cfa(cog, df_valid, groups, group_items, item_cols):
         est = mod.inspect(std_est=True, se_robust=cfg.CFA_ROBUST_SE).copy()
         meas = est[(est["op"] == "~") & (est["rval"].isin(groups)) & (est["lval"].isin(item_cols))].copy()
 
-        std_candidates = ["Std. Ests","Est. Std","Std.Est","Std. Estimate","Std. Est","std_est"]
+        std_candidates = ["Std. Ests", "Est. Std", "Std.Est", "Std. Estimate", "Std. Est", "std_est"]
         std_col = next((c for c in std_candidates if c in meas.columns), None)
         used_std = True
         if std_col is None:
             std_col = "Estimate"
             used_std = False
 
-        CFA_Loadings = meas.rename(columns={"rval":"Construct","lval":"Item", std_col:"Std_Loading"})[
-            ["Construct","Item","Std_Loading"]
+        CFA_Loadings = meas.rename(columns={"rval": "Construct", "lval": "Item", std_col: "Std_Loading"})[
+            ["Construct", "Item", "Std_Loading"]
         ].copy()
         CFA_Loadings["Std_Loading"] = pd.to_numeric(CFA_Loadings["Std_Loading"], errors="coerce")
         CFA_Loadings["Flag_|loading|>1"] = (CFA_Loadings["Std_Loading"].abs() > 1.0) if used_std else np.nan
-        CFA_Loadings["Std_Loading"] = CFA_Loadings["Std_Loading"].round(3)
+        CFA_Loadings["Std_Loading"] = CFA_Loadings["Std_Loading"].round(dec)
         CFA_Loadings["Construct"] = pd.Categorical(CFA_Loadings["Construct"], categories=groups, ordered=True)
-        CFA_Loadings = CFA_Loadings.sort_values(["Construct","Item"]).reset_index(drop=True)
+        CFA_Loadings = CFA_Loadings.sort_values(["Construct", "Item"]).reset_index(drop=True)
 
         stats = calc_stats(mod)
         if isinstance(stats, pd.DataFrame):
-            tmp = stats.T.reset_index().rename(columns={"index":"FitIndex","Value":"Value"})
+            tmp = stats.T.reset_index().rename(columns={"index": "FitIndex", "Value": "Value"})
         else:
-            tmp = pd.DataFrame(list(stats.items()), columns=["FitIndex","Value"])
+            tmp = pd.DataFrame(list(stats.items()), columns=["FitIndex", "Value"])
         tmp["Value"] = pd.to_numeric(tmp["Value"], errors="coerce").round(4)
         CFA_Fit = tmp
 
@@ -244,7 +278,7 @@ def run_cfa(cog, df_valid, groups, group_items, item_cols):
 
     except Exception as e:
         return (
-            pd.DataFrame([{"Info":"CFA failed","Error":str(e)}]),
-            pd.DataFrame([{"CFA_error":str(e)}]),
-            pd.DataFrame([{"Info":"CFA failed","Error":str(e)}]),
+            pd.DataFrame([{"Info": "CFA failed", "Error": str(e)}]),
+            pd.DataFrame([{"CFA_error": str(e)}]),
+            pd.DataFrame([{"Info": "CFA failed", "Error": str(e)}]),
         )
