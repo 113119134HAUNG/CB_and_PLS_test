@@ -115,6 +115,8 @@ class PLSConfig:
     PAPER_DECIMALS: int = 3
 
     # ---- Bootstrap CI (paper) ----
+    BOOT_TEST_TYPE: str = "two-tailed"   # "one-tailed" | "two-tailed"
+    BOOT_ALPHA: float = 0.05            # SmartPLS 的 Significance Level :contentReference[oaicite:3]{index=3}
     BOOT_CI_LO: float = 0.025
     BOOT_CI_HI: float = 0.975
 
