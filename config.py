@@ -1,11 +1,8 @@
 # pls_project/config.py
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List, Dict, Union
 
-# ==============================
-# Column config (meta columns)
-# ==============================
 @dataclass
 class ColumnConfig:
     TS_COL: str    = "時間戳記"
@@ -13,28 +10,17 @@ class ColumnConfig:
     EXP_COL: str   = "請問您是否曾使用 GenAI 進行學習的經驗？"
     EMAIL_COL: str = "電子郵件地址"
 
-# ==============================
-# Runtime filled by schema
-# ==============================
 @dataclass
 class RuntimeConfig:
-    """
-    schema.py 解析 df.columns 後，會把結果寫回這裡（runtime in-memory）。
-    - profile_name: 問卷版本（v1/v2/v3/unknown）
-    - scale_prefixes: 該版本的題項 prefix 清單
-    - rename_map: 原欄名 -> token（題項欄位）
-    """
     profile_name: str = "unknown"
     scale_prefixes: List[str] = field(default_factory=list)
     rename_map: Dict[str, str] = field(default_factory=dict)
+    resolved_cols: Dict[str, str] = field(default_factory=dict)  # TS_COL/USER_COL/...
 
-# ==============================
-# 其他 configs（你原本的）
-# ==============================
 @dataclass
 class IOConfig:
     XLSX_PATH: str = "/content/drive/MyDrive/BACK.xlsx"
-    SHEET_NAME: int | str = 0
+    SHEET_NAME: Union[int, str] = 0
     OUT_XLSX_BASE: str = "/content/drive/MyDrive/前測_論文表格輸出"
     OUT_CSV_BASE: str = "/content/drive/MyDrive/BACK_scored"
     PAPER_SHEET: str = "Paper_OnePage"
@@ -69,13 +55,13 @@ class CFAConfig:
 class PLSConfig:
     RUN_PLS: bool = True
     PLS_MISSING: str = "mean"
-    PLS_SCHEME: str = "PATH"          # SmartPLS4 對齊：PATH / FACTORIAL / PCA
+    PLS_SCHEME: str = "PATH"
     HTMT_CORR_METHOD: str = "pearson"
     PLS_BOOT: int = 200
     PLS_SEED: int = 0
     Q2_FOLDS: int = 5
-    PLSPM_MAX_ITER: int = 3000        # SmartPLS4 對齊
-    PLSPM_TOL: float = 1e-7           # SmartPLS4 對齊
+    PLSPM_MAX_ITER: int = 3000
+    PLSPM_TOL: float = 1e-7
     BOOT_RETRY: int = 5
 
 @dataclass
@@ -90,9 +76,6 @@ class ScenarioConfig:
     SCENARIO_TARGET: str = "PA"
     RUN_REVERSE_SCENARIO: bool = False
 
-# ==============================
-# Main Config container
-# ==============================
 @dataclass
 class Config:
     cols: ColumnConfig = field(default_factory=ColumnConfig)
@@ -103,6 +86,4 @@ class Config:
     pls: PLSConfig = field(default_factory=PLSConfig)
     mga: MGAConfig = field(default_factory=MGAConfig)
     scenario: ScenarioConfig = field(default_factory=ScenarioConfig)
-
-    # schema.py 會填充這裡
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
