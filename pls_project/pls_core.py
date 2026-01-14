@@ -353,7 +353,6 @@ def get_path_results(
         return pd.DataFrame()
     return path_estimates_from_scores(scores_df, path_df)
 
-
 def get_outer_results(
     model,
     X: pd.DataFrame,
@@ -364,38 +363,218 @@ def get_outer_results(
     strict: bool = True,
 ) -> pd.DataFrame:
     """
-    Prefer extracting outer loadings/weights from plspm model.
-    If strict=False, fallback to corr(indicator, LVscore) for reflective loadings.
+    Robust outer extraction from plspm model API.
 
-    Return columns:
-      Construct, Indicator, Mode, OuterLoading, OuterWeight, Communality(h2)
+    Tries, in order:
+      1) model.outer_model() / model.crossloadings() as "long table"
+      2) same candidates as "matrix" (indicator x construct)
+      3) if candidate object has .loadings/.weights attributes -> use those matrices
+      4) strict=True -> raise with debug info
+         strict=False -> corr fallback
     """
-    cand = _first_existing_attr(model, ["outer_model", "outer", "outer_summary", "measurement_model"])
-    cand = _maybe_call(cand)
-    OM = _ensure_df(cand)
 
-    if OM is not None and not OM.empty:
-        cols = {c.lower(): c for c in OM.columns}
+    expected_lvs = list(scores_df.columns) if scores_df is not None else list(lv_blocks.keys())
+    expected_lvs = [lv for lv in expected_lvs if lv in lv_blocks or lv in expected_lvs]
+    expected_inds = []
+    for lv in expected_lvs:
+        for it in lv_blocks.get(lv, []):
+            if it not in expected_inds:
+                expected_inds.append(it)
+
+    def _to_df(obj) -> Optional[pd.DataFrame]:
+        if obj is None:
+            return None
+        obj = _maybe_call(obj)
+
+        if isinstance(obj, pd.DataFrame):
+            return obj
+
+        # if it's list/tuple of dicts/objects
+        if isinstance(obj, (list, tuple)) and len(obj) > 0:
+            first = obj[0]
+            if isinstance(first, dict):
+                try:
+                    return pd.DataFrame(obj)
+                except Exception:
+                    return None
+            # namedtuple / dataclass / row object
+            if hasattr(first, "_asdict"):
+                try:
+                    return pd.DataFrame([x._asdict() for x in obj])
+                except Exception:
+                    return None
+            if hasattr(first, "__dict__"):
+                try:
+                    return pd.DataFrame([x.__dict__ for x in obj])
+                except Exception:
+                    return None
+
+        # common wrappers
+        for attr in ["df", "dataframe", "table", "data", "frame", "values"]:
+            if hasattr(obj, attr):
+                v = getattr(obj, attr)
+                v = _maybe_call(v)
+                if isinstance(v, pd.DataFrame):
+                    return v
+                try:
+                    return pd.DataFrame(v)
+                except Exception:
+                    pass
+
+        # conversion methods
+        for meth in ["to_dataframe", "to_df", "as_dataframe", "to_pandas", "to_dict"]:
+            if hasattr(obj, meth) and callable(getattr(obj, meth)):
+                try:
+                    v = getattr(obj, meth)()
+                except Exception:
+                    continue
+                if isinstance(v, pd.DataFrame):
+                    return v
+                try:
+                    return pd.DataFrame(v)
+                except Exception:
+                    pass
+
+        try:
+            return pd.DataFrame(obj)
+        except Exception:
+            return None
+
+    def _looks_like_matrix(DF: pd.DataFrame) -> bool:
+        if DF is None or DF.empty:
+            return False
+        # indicator x construct
+        ind_hit = len(set(expected_inds) & set(map(str, DF.index)))
+        lv_hit = len(set(expected_lvs) & set(map(str, DF.columns)))
+        if ind_hit > 0 and lv_hit > 0:
+            return True
+        # maybe transposed
+        ind_hit2 = len(set(expected_inds) & set(map(str, DF.columns)))
+        lv_hit2 = len(set(expected_lvs) & set(map(str, DF.index)))
+        return (ind_hit2 > 0 and lv_hit2 > 0)
+
+    def _matrix_to_outer(M: pd.DataFrame) -> pd.DataFrame:
+        # normalize orientation
+        if set(expected_inds).issubset(set(map(str, M.index))) and set(expected_lvs).issubset(set(map(str, M.columns))):
+            Mat = M.copy()
+        elif set(expected_lvs).issubset(set(map(str, M.index))) and set(expected_inds).issubset(set(map(str, M.columns))):
+            Mat = M.T.copy()
+        else:
+            # shape-based fallback
+            A = M.to_numpy()
+            if A.shape == (len(expected_inds), len(expected_lvs)):
+                Mat = pd.DataFrame(A, index=expected_inds, columns=expected_lvs)
+            elif A.shape == (len(expected_lvs), len(expected_inds)):
+                Mat = pd.DataFrame(A.T, index=expected_inds, columns=expected_lvs)
+            else:
+                raise ValueError("Cannot align matrix to indicators x constructs.")
+
+        rows = []
+        for lv in expected_lvs:
+            mode = str(lv_modes.get(lv, "A")).upper()
+            for it in lv_blocks.get(lv, []):
+                ol = np.nan
+                if (it in Mat.index) and (lv in Mat.columns):
+                    ol = pd.to_numeric(Mat.loc[it, lv], errors="coerce")
+                rows.append({
+                    "Construct": lv,
+                    "Indicator": it,
+                    "Mode": "A(reflective)" if mode == "A" else "B(formative)",
+                    "OuterLoading": float(ol) if pd.notna(ol) else np.nan,
+                    "OuterWeight": np.nan,
+                    "Communality(h2)": (float(ol) ** 2) if (mode == "A" and pd.notna(ol)) else np.nan,
+                })
+        return pd.DataFrame(rows)
+
+    def _try_long_table(DF: pd.DataFrame) -> Optional[pd.DataFrame]:
+        if DF is None or DF.empty:
+            return None
+        cols = {str(c).lower(): c for c in DF.columns}
+
         c_construct = cols.get("block") or cols.get("construct") or cols.get("lv") or cols.get("latent") or cols.get("name_lv")
-        c_ind = cols.get("name") or cols.get("indicator") or cols.get("mv") or cols.get("manifest") or cols.get("name_mv")
-        c_loading = cols.get("loading") or cols.get("outer_loading")
-        c_weight = cols.get("weight") or cols.get("outer_weight")
+        c_ind = cols.get("name") or cols.get("indicator") or cols.get("mv") or cols.get("manifest") or cols.get("name_mv") or cols.get("item")
+        c_loading = cols.get("loading") or cols.get("outer_loading") or cols.get("std_loading") or cols.get("standardized_loading")
+        c_weight = cols.get("weight") or cols.get("outer_weight") or cols.get("outer_weights")
 
-        if c_construct and c_ind:
-            out = pd.DataFrame({
-                "Construct": OM[c_construct].astype(str),
-                "Indicator": OM[c_ind].astype(str),
-                "OuterLoading": pd.to_numeric(OM[c_loading], errors="coerce") if c_loading else np.nan,
-                "OuterWeight": pd.to_numeric(OM[c_weight], errors="coerce") if c_weight else np.nan,
-            })
-            out["Mode"] = out["Construct"].map(lambda lv: str(lv_modes.get(lv, "A")).upper())
-            out["Mode"] = out["Mode"].map(lambda m: "A(reflective)" if m == "A" else "B(formative)")
-            out["Communality(h2)"] = pd.to_numeric(out["OuterLoading"], errors="coerce") ** 2
-            return out[["Construct", "Indicator", "Mode", "OuterLoading", "OuterWeight", "Communality(h2)"]]
+        if (c_construct is None) or (c_ind is None):
+            # attempt overlap-based inference
+            best_lv = (None, -1)
+            best_it = (None, -1)
+            for c in DF.columns:
+                s = DF[c].astype(str)
+                lv_hit = int(s.isin(expected_lvs).sum())
+                it_hit = int(s.isin(expected_inds).sum())
+                if lv_hit > best_lv[1]:
+                    best_lv = (c, lv_hit)
+                if it_hit > best_it[1]:
+                    best_it = (c, it_hit)
+            c_construct = best_lv[0] if best_lv[1] > 0 else None
+            c_ind = best_it[0] if best_it[1] > 0 else None
+
+        if c_construct is None or c_ind is None:
+            return None
+
+        out = pd.DataFrame({
+            "Construct": DF[c_construct].astype(str),
+            "Indicator": DF[c_ind].astype(str),
+        })
+        out["OuterLoading"] = pd.to_numeric(DF[c_loading], errors="coerce") if c_loading else np.nan
+        out["OuterWeight"] = pd.to_numeric(DF[c_weight], errors="coerce") if c_weight else np.nan
+
+        out["Mode"] = out["Construct"].map(lambda lv: str(lv_modes.get(lv, "A")).upper())
+        out["Mode"] = out["Mode"].map(lambda m: "A(reflective)" if m == "A" else "B(formative)")
+        out["Communality(h2)"] = pd.to_numeric(out["OuterLoading"], errors="coerce") ** 2
+        return out[["Construct","Indicator","Mode","OuterLoading","OuterWeight","Communality(h2)"]]
+
+    # candidates to try
+    cand_names = ["outer_model", "crossloadings", "outer", "outer_summary", "measurement_model"]
+
+    for nm in cand_names:
+        if not hasattr(model, nm):
+            continue
+        raw = getattr(model, nm)
+
+        # unwrap
+        DF = _to_df(raw)
+
+        # 1) long-table try
+        out = _try_long_table(DF)
+        if out is not None and not out.empty:
+            return out
+
+        # 2) matrix try
+        if DF is not None and _looks_like_matrix(DF):
+            try:
+                return _matrix_to_outer(DF)
+            except Exception:
+                pass
+
+        # 3) object might contain .loadings / .weights
+        obj = _maybe_call(raw)
+        for sub in ["loadings", "weights", "outer_loadings", "outer_weights"]:
+            if hasattr(obj, sub):
+                sub_df = _to_df(getattr(obj, sub))
+                if sub_df is not None and _looks_like_matrix(sub_df):
+                    try:
+                        tmp = _matrix_to_outer(sub_df)
+                        # treat weights if available
+                        if sub.lower().endswith("weights"):
+                            tmp["OuterWeight"] = tmp["OuterLoading"]
+                            tmp["OuterLoading"] = np.nan
+                            tmp["Communality(h2)"] = np.nan
+                        return tmp
+                    except Exception:
+                        pass
 
     if strict:
-        raise AttributeError("Cannot extract outer model (loadings/weights) from plspm model API.")
+        # show what we tried for faster debugging
+        available = [a for a in dir(model) if any(k in a.lower() for k in ["outer","loading","weight","cross"])]
+        raise AttributeError(
+            "Cannot extract outer model from plspm model API. "
+            f"Tried {cand_names}. Available outer-related attrs={available}"
+        )
 
+    # last resort: correlation fallback
     cross = corr_items_vs_scores(X, scores_df, method="pearson")
     rows = []
     for lv, inds in lv_blocks.items():
@@ -413,7 +592,6 @@ def get_outer_results(
                 "Communality(h2)": (ol ** 2) if mode == "A" else np.nan,
             })
     return pd.DataFrame(rows)
-
 
 # =========================================================
 # 4) Structural helpers (diagnostics)
