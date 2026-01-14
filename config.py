@@ -127,7 +127,7 @@ class PLSConfig:
     PLS_MISSING: str = "listwise"        # "none" | "listwise" | "mean"
 
     # ---- Bootstrap / diagnostics ----
-    PLS_BOOT: int = 200
+    PLS_BOOT: int = 10000
     PLS_SEED: int = 0
     Q2_FOLDS: int = 5
 
