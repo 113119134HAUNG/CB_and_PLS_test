@@ -23,11 +23,200 @@ from pls_project.pls_core import (
     r2_f2_from_scores,
     q2_cv_from_scores,
     structural_vif,
+    # bootstrap needs these:
+    run_plspm_python,
+    get_path_results,
+    apply_sign_to_paths,
+    get_sign_map_by_anchors,
 )
 from pls_project.pls_estimate import estimate_pls_basic_paper
+from pls_project.pls_bootstrap import summarize_direct_ci
 
-# 若你之後有做 bootstrap loop，再把 summarize_direct_ci 用起來
-# from pls_project.pls_bootstrap import summarize_direct_ci
+
+def _apply_sign_to_scores(scores_df: pd.DataFrame, sign_map: dict) -> pd.DataFrame:
+    """Flip LV scores using sign_map (+1/-1)."""
+    out = scores_df.copy()
+    for lv, s in sign_map.items():
+        if lv in out.columns and int(s) == -1:
+            out[lv] = -out[lv]
+    return out
+
+
+def _bootstrap_paths_single_model(
+    cog,
+    *,
+    X: pd.DataFrame,
+    path_df: pd.DataFrame,
+    lv_blocks: dict,
+    lv_modes: dict,
+    order: list[str],
+    key_df: pd.DataFrame,
+    anchors: dict,
+) -> np.ndarray:
+    """
+    Bootstrap direct paths for a single model.
+    - Resample rows with replacement
+    - Re-run plspm
+    - Extract path coefficients from model API
+    - Apply sign alignment based on the same anchors
+    """
+    cfg = cog.cfg.pls
+    B = int(cfg.PLS_BOOT)
+    seed = int(cfg.PLS_SEED)
+    retry = int(getattr(cfg, "BOOT_RETRY", 0))
+    sign_fix_on = bool(getattr(cfg, "SIGN_FIX", True))
+
+    rng = np.random.default_rng(seed)
+    n = int(X.shape[0])
+    boot = np.full((B, len(key_df)), np.nan, dtype=float)
+
+    for b in range(B):
+        idx = rng.integers(0, n, size=n)
+        Xb = X.iloc[idx].reset_index(drop=True)
+
+        ok = False
+        for _ in range(max(1, retry + 1)):
+            try:
+                mb, sb = run_plspm_python(
+                    cog,
+                    Xb,
+                    path_df,
+                    lv_blocks,
+                    lv_modes,
+                    scaled=bool(getattr(cfg, "PLS_STANDARDIZED", True)),
+                )
+
+                # for sign map only
+                sb = sb[order].copy()
+
+                if sign_fix_on and anchors:
+                    sign_map_b = get_sign_map_by_anchors(Xb, sb, anchors)
+                else:
+                    sign_map_b = {}
+
+                pe_b = get_path_results(mb, path_df, strict=True)
+                if sign_fix_on and anchors:
+                    pe_b = apply_sign_to_paths(pe_b, sign_map_b)
+
+                pe_b = key_df.merge(pe_b, on=["from", "to"], how="left")
+                if pe_b["estimate"].isna().any():
+                    raise RuntimeError("Missing path estimate in a bootstrap replicate (single model).")
+
+                boot[b, :] = pe_b["estimate"].astype(float).values
+                ok = True
+                break
+            except Exception:
+                ok = False
+                continue
+
+        # optional progress
+        if (b % 200) == 0:
+            cog.log.info(f"Bootstrap(single) {b}/{B} ok={ok}")
+
+    return boot
+
+
+def _bootstrap_paths_two_stage_model2(
+    cog,
+    *,
+    X_stage1: pd.DataFrame,
+    path1: pd.DataFrame,
+    lv_blocks1: dict,
+    lv_modes1: dict,
+    order1: list[str],
+    anchors1: dict,
+    path2: pd.DataFrame,
+    lv_blocks2: dict,
+    lv_modes2: dict,
+    order2: list[str],
+    anchors2: dict,
+    key2: pd.DataFrame,
+) -> np.ndarray:
+    """
+    Bootstrap Model2 (two-stage):
+      - resample original indicators
+      - stage1: re-run Model1 to obtain ACO/CCO scores (sign-aligned)
+      - create ACO_score / CCO_score
+      - stage2: run Model2 and extract path coefficients (sign-aligned)
+    """
+    cfg = cog.cfg.pls
+    B = int(cfg.PLS_BOOT)
+    seed = int(cfg.PLS_SEED)
+    retry = int(getattr(cfg, "BOOT_RETRY", 0))
+    sign_fix_on = bool(getattr(cfg, "SIGN_FIX", True))
+
+    rng = np.random.default_rng(seed)
+    n = int(X_stage1.shape[0])
+    boot2 = np.full((B, len(key2)), np.nan, dtype=float)
+
+    for b in range(B):
+        idx = rng.integers(0, n, size=n)
+        Xb = X_stage1.iloc[idx].reset_index(drop=True)
+
+        ok = False
+        for _ in range(max(1, retry + 1)):
+            try:
+                # ---- stage1 ----
+                m1b, s1b = run_plspm_python(
+                    cog,
+                    Xb,
+                    path1,
+                    lv_blocks1,
+                    lv_modes1,
+                    scaled=bool(getattr(cfg, "PLS_STANDARDIZED", True)),
+                )
+                s1b = s1b[order1].copy()
+
+                if sign_fix_on and anchors1:
+                    sign_map1b = get_sign_map_by_anchors(Xb, s1b, anchors1)
+                    s1b = _apply_sign_to_scores(s1b, sign_map1b)
+
+                if ("ACO" not in s1b.columns) or ("CCO" not in s1b.columns):
+                    raise RuntimeError("Stage1 bootstrap missing ACO/CCO scores.")
+
+                if s1b[["ACO", "CCO"]].isna().any().any():
+                    raise RuntimeError("Stage1 bootstrap ACO/CCO scores contain NaN (clean mode forbids fill).")
+
+                Xb2 = Xb.copy()
+                Xb2["ACO_score"] = s1b["ACO"].to_numpy()
+                Xb2["CCO_score"] = s1b["CCO"].to_numpy()
+
+                # ---- stage2 ----
+                m2b, s2b = run_plspm_python(
+                    cog,
+                    Xb2,
+                    path2,
+                    lv_blocks2,
+                    lv_modes2,
+                    scaled=bool(getattr(cfg, "PLS_STANDARDIZED", True)),
+                )
+                s2b = s2b[order2].copy()
+
+                if sign_fix_on and anchors2:
+                    sign_map2b = get_sign_map_by_anchors(Xb2, s2b, anchors2)
+                else:
+                    sign_map2b = {}
+
+                pe2b = get_path_results(m2b, path2, strict=True)
+                if sign_fix_on and anchors2:
+                    pe2b = apply_sign_to_paths(pe2b, sign_map2b)
+
+                pe2b = key2.merge(pe2b, on=["from", "to"], how="left")
+                if pe2b["estimate"].isna().any():
+                    raise RuntimeError("Missing path estimate in a bootstrap replicate (model2).")
+
+                boot2[b, :] = pe2b["estimate"].astype(float).values
+                ok = True
+                break
+
+            except Exception:
+                ok = False
+                continue
+
+        if (b % 200) == 0:
+            cog.log.info(f"Bootstrap(two-stage) {b}/{B} ok={ok}")
+
+    return boot2
 
 
 def run_pipeline(cog, reverse_target: bool, tag: str):
@@ -51,11 +240,8 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     # ==============================
     resolved_cols, profile_name, scale_prefixes, rename_map = resolve_schema(df, cfg, cog)
 
-    # Rename item columns -> token
     if rename_map:
         df = df.rename(columns=rename_map)
-
-        # ✅ 防呆：rename 後不能有重複欄名
         if df.columns.duplicated().any():
             dups = df.columns[df.columns.duplicated()].tolist()
             raise ValueError(
@@ -63,20 +249,17 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 "This usually means multiple original columns mapped to the same token."
             )
 
-    # Meta columns (prefer resolved; fallback to cfg.cols.*)
     TS_COL = resolved_cols.get("TS_COL", cfg.cols.TS_COL)
     USER_COL = resolved_cols.get("USER_COL", cfg.cols.USER_COL)
     EMAIL_COL = resolved_cols.get("EMAIL_COL", cfg.cols.EMAIL_COL)
     EXP_COL = resolved_cols.get("EXP_COL", cfg.cols.EXP_COL)
 
-    # ✅ 防呆：若 rename_map 也改到了 meta 欄（通常不會，但保險）
     if rename_map:
         TS_COL = rename_map.get(TS_COL, TS_COL)
         USER_COL = rename_map.get(USER_COL, USER_COL)
         EMAIL_COL = rename_map.get(EMAIL_COL, EMAIL_COL)
         EXP_COL = rename_map.get(EXP_COL, EXP_COL)
 
-    # Scales (prefer detected profile; fallback to cfg.scales.SCALES)
     SCALES = list(scale_prefixes) if scale_prefixes else list(cfg.scales.SCALES)
 
     # ==============================
@@ -88,8 +271,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     item_cols = [c for c in df.columns if item_pat.fullmatch(str(c))]
     if not item_cols:
         raise ValueError(
-            f"找不到題項欄位！"
-            f"目前 profile={profile_name}, prefixes={SCALES}. "
+            f"找不到題項欄位！profile={profile_name}, prefixes={SCALES}. "
             f"請確認欄名是否已被 schema rename 成 token（如 PA1 / SRL3 / A11）。"
         )
 
@@ -137,7 +319,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     if EXP_COL in df.columns:
         df["_flag_noexp"] = ~df[EXP_COL].apply(has_experience)
 
-    # timestamp for duplicate resolution
     df["_ts"] = pd.to_datetime(df[TS_COL], errors="coerce") if TS_COL in df.columns else pd.NaT
     df["_orig_order"] = np.arange(len(df))
 
@@ -153,7 +334,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     for c in item_cols:
         df[c] = df[c].apply(to_score).astype(float)
 
-    # reverse items
     for c in REVERSE_ITEMS:
         if c in df.columns:
             df[c] = df[c].apply(reverse_1to5).astype(float)
@@ -208,11 +388,10 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     FA1Table = one_factor_fa_table(cog, df_valid, groups, group_items)
     EFA1Table, EFA1Fit = one_factor_efa_table(cog, df_valid, groups, group_items)
 
-    # CFA
     CFA_Loadings, CFA_Info, CFA_Fit = run_cfa(cog, df_valid, groups, group_items, item_cols)
 
     # ==============================
-    # PLS main (one-shot estimation)
+    # PLS main (estimation + bootstrap)
     # ==============================
     PLS1_info = PLS1_outer = PLS1_quality = PLS1_htmt = PLS1_cross = pd.DataFrame()
     PLS2_info = PLS2_outer = PLS2_quality = PLS2_htmt = PLS2_cross = PLS2_commitment = pd.DataFrame()
@@ -233,7 +412,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
         Xpls = df_valid[item_cols].copy().astype(float)
 
-        # missing handling (config-driven)
         miss = str(getattr(cfg.pls, "PLS_MISSING", "listwise")).lower()
         if miss == "none":
             if Xpls.isna().any().any():
@@ -294,11 +472,25 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             "scheme": cfg.pls.PLS_SCHEME,
             "missing": cfg.pls.PLS_MISSING,
             "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
+            "B(bootstrap)": int(cfg.pls.PLS_BOOT),
             "estimates": "outer/path from plspm model API (strict)",
         }])
 
+        # ---- Bootstrap Model1 direct paths ----
+        if int(cfg.pls.PLS_BOOT) > 0:
+            boot1 = _bootstrap_paths_single_model(
+                cog,
+                X=Xpls,
+                path_df=path1,
+                lv_blocks=lv_blocks1,
+                lv_modes=lv_modes1,
+                order=order1,
+                key_df=res1["key"],
+                anchors=res1["anchors"],
+            )
+            PLS1_BOOTPATH = summarize_direct_ci(cog, res1["key"], res1["est"], boot1)
+
         # ---- Model2 (two-stage Commitment formative) ----
-        # ✅ 更穩：若缺 ACO/CCO，直接跳過 Model2
         can_run_m2 = ("ACO" in scores1.columns) and ("CCO" in scores1.columns) and ("ACO" in groups) and ("CCO" in groups)
         if can_run_m2 and (not scores1[["ACO", "CCO"]].isna().any().any()):
             edges2 = [
@@ -365,18 +557,35 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 "scheme": cfg.pls.PLS_SCHEME,
                 "missing": cfg.pls.PLS_MISSING,
                 "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
+                "B(bootstrap)": int(cfg.pls.PLS_BOOT),
                 "estimates": "outer/path from plspm model API (strict)",
             }])
+
+            # ---- Bootstrap Model2 direct paths (two-stage) ----
+            if int(cfg.pls.PLS_BOOT) > 0:
+                boot2 = _bootstrap_paths_two_stage_model2(
+                    cog,
+                    X_stage1=Xpls,
+                    path1=path1,
+                    lv_blocks1=lv_blocks1,
+                    lv_modes1=lv_modes1,
+                    order1=order1,
+                    anchors1=res1["anchors"],
+                    path2=path2,
+                    lv_blocks2=lv_blocks2,
+                    lv_modes2=lv_modes2,
+                    order2=order2,
+                    anchors2=res2["anchors"],
+                    key2=res2["key"],
+                )
+                PLS2_BOOTPATH = summarize_direct_ci(cog, res2["key"], res2["est"], boot2)
+
         else:
             PLS2_info = pd.DataFrame([{
                 "Info": "Model2 skipped (needs ACO/CCO constructs and non-missing ACO/CCO scores).",
                 "profile": profile_name,
                 "tag": tag,
             }])
-
-        # Bootstrap direct paths (目前留空；你若之後做 bootstrap loop 再填)
-        PLS1_BOOTPATH = pd.DataFrame()
-        PLS2_BOOTPATH = pd.DataFrame()
 
     # ==============================
     # Export Excel + CSV
