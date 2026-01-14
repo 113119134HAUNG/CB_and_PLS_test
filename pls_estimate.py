@@ -1,7 +1,10 @@
-# pls_estimate.py
+# pls_project/pls_estimate.py
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 from typing import Optional, Dict
+
 from pls_project.pls_core import (
     run_plspm_python,
     corr_items_vs_scores,
@@ -12,10 +15,8 @@ from pls_project.pls_core import (
     get_sign_map_by_anchors,
     quality_paper_table,
 )
+from pls_project.sign_fix import choose_anchors_by_max_abs_loading
 
-from pls_project.sign_fix import (
-    choose_anchors_by_max_abs_loading,
-)
 
 def _apply_sign_to_scores(scores_df: pd.DataFrame, sign_map: dict) -> pd.DataFrame:
     """Flip LV scores using sign_map (+1/-1)."""
@@ -24,6 +25,7 @@ def _apply_sign_to_scores(scores_df: pd.DataFrame, sign_map: dict) -> pd.DataFra
         if lv in out.columns and int(s) == -1:
             out[lv] = -out[lv]
     return out
+
 
 def estimate_pls_basic_paper(
     cog,
@@ -34,14 +36,58 @@ def estimate_pls_basic_paper(
     lv_blocks: dict,
     lv_modes: dict,
     order: list[str],
-    anchor_overrides: Optional[Dict[str, str]] = None,   # ✅ NEW
+    anchor_overrides: Optional[Dict[str, str]] = None,
 ):
-    ...
-    sign_fix_on = bool(getattr(cfg, "SIGN_FIX", True))
+    """
+    One-shot clean output:
+      - plspm model API provides estimation (outer/path) [strict=True]
+      - cross-loadings by correlation (inspection only)
+      - sign orientation uses ONE sign_map for scores/outer/paths (no double-corr)
+      - optional anchor_overrides, e.g. {"Commitment": "CCO_score"}
+
+    Returns dict:
+      model, scores, anchors, sign_map,
+      PLS_cross, PLS_outer, PLS_quality,
+      paths_long, key, est
+    """
+    cfg = cog.cfg.pls
+
+    # require these configs (no silent defaults)
+    for k in ["PAPER_DECIMALS", "PLS_CROSS_CORR_METHOD", "PLS_STANDARDIZED", "SIGN_FIX"]:
+        if not hasattr(cfg, k):
+            raise AttributeError(f"Config.pls must define {k}.")
+
+    dec = int(cfg.PAPER_DECIMALS)
+    cross_method = str(cfg.PLS_CROSS_CORR_METHOD)
+
+    # 1) run model
+    model, scores = run_plspm_python(
+        cog,
+        Xpls,
+        path_df,
+        lv_blocks,
+        lv_modes,
+        scaled=bool(cfg.PLS_STANDARDIZED),
+    )
+    if model is None:
+        # In your clean pls_core.py, PCA is disallowed, so model should never be None.
+        raise ValueError("plspm model is None. This usually means scheme returned scores-only (not allowed in clean mode).")
+
+    # 2) strict LV alignment
+    missing = [lv for lv in order if lv not in scores.columns]
+    if missing:
+        raise KeyError(
+            f"LV scores missing columns from plspm output: {missing}. "
+            f"Available={list(scores.columns)}"
+        )
+    scores = scores[order].copy()
+
+    # 3) sign-fix (optional) — ONE sign_map controls everything
+    sign_fix_on = bool(cfg.SIGN_FIX)
     if sign_fix_on:
         anchors = choose_anchors_by_max_abs_loading(Xpls, scores, lv_blocks)
 
-        # ✅ NEW: allow override (e.g., Commitment -> "CCO_score")
+        # allow override (e.g., Commitment -> "CCO_score")
         if anchor_overrides:
             anchors.update(anchor_overrides)
 
@@ -52,11 +98,7 @@ def estimate_pls_basic_paper(
         sign_map = {}
 
     # 4) cross-loadings (inspection only)
-    PLS_cross = corr_items_vs_scores(
-        Xpls[item_cols],
-        scores[order],
-        method=cross_method
-    ).round(dec)
+    PLS_cross = corr_items_vs_scores(Xpls[item_cols], scores[order], method=cross_method).round(dec)
     PLS_cross.index.name = "Item"
 
     # 5) outer results: STRICT from model API
