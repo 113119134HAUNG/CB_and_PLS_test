@@ -1,17 +1,24 @@
-# pls_bootstrap.py
+# pls_project/pls_bootstrap.py
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
+
 
 def _safe_t(est: np.ndarray, se: np.ndarray) -> np.ndarray:
     est = np.asarray(est, dtype=float)
     se = np.asarray(se, dtype=float)
     return np.divide(np.abs(est), se, out=np.full_like(est, np.nan), where=(se > 0))
 
+
 def _ci_sig(ci_l: np.ndarray, ci_u: np.ndarray) -> np.ndarray:
     ci_l = np.asarray(ci_l, dtype=float)
     ci_u = np.asarray(ci_u, dtype=float)
-    # significant if CI does NOT include 0
-    return (ci_l > 0) | (ci_u < 0)
+    ok = np.isfinite(ci_l) & np.isfinite(ci_u)
+    sig = np.full_like(ci_l, False, dtype=bool)
+    sig[ok] = (ci_u[ok] < 0) | (ci_l[ok] > 0)
+    return sig
+
 
 def summarize_direct_ci(
     cog,
@@ -25,11 +32,18 @@ def summarize_direct_ci(
     Sig: CI does not include 0
     """
     cfg = cog.cfg.pls
-    dec = int(getattr(cfg, "PAPER_DECIMALS", 3))
-    qlo = float(getattr(cfg, "BOOT_CI_LO", 0.025))
-    qhi = float(getattr(cfg, "BOOT_CI_HI", 0.975))
+
+    # clean: require these to exist in config (no hidden defaults)
+    if not hasattr(cfg, "PAPER_DECIMALS") or not hasattr(cfg, "BOOT_CI_LO") or not hasattr(cfg, "BOOT_CI_HI"):
+        raise AttributeError("Config.pls must define PAPER_DECIMALS, BOOT_CI_LO, BOOT_CI_HI (clean mode).")
+
+    dec = int(cfg.PAPER_DECIMALS)
+    qlo = float(cfg.BOOT_CI_LO)
+    qhi = float(cfg.BOOT_CI_HI)
 
     point_est = np.asarray(point_est, dtype=float)
+    boot = np.asarray(boot, dtype=float)
+
     se = np.nanstd(boot, axis=0, ddof=1)
     t = _safe_t(point_est, se)
 
