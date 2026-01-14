@@ -50,22 +50,19 @@ PROFILES = [
     {
         "name": "v1",
         "signatures_any": ["PA1", "BS1", "BB1", "SA1", "ACO1", "CCO1", "MIND1", "CI1", "LO1"],
-        "scale_prefixes": ["PA","BS","BB","SA","ACO","CCO","MIND","CI","LO"],
-        # v1 欄名通常就是 token 本身：PA1, BS2...
+        "scale_prefixes": ["PA", "BS", "BB", "SA", "ACO", "CCO", "MIND", "CI", "LO"],
         "item_token_regex": r"^([A-Z]{1,6}\d{1,2})\b",
     },
     {
         "name": "v2",
-        "signatures_any": ["SRL2","SRL3","AM1","CN1","RN1","AN1","EM1","KS1","LO1"],
-        "scale_prefixes": ["SRL","AM","CN","RN","AN","EM","KS","LO"],
-        # v2 可能是 "SRL3 我會將..."：取最前面的 token
+        "signatures_any": ["SRL2", "SRL3", "AM1", "CN1", "RN1", "AN1", "EM1", "KS1", "LO1"],
+        "scale_prefixes": ["SRL", "AM", "CN", "RN", "AN", "EM", "KS", "LO"],
         "item_token_regex": r"^([A-Z]{1,6}\d{1,2})\b",
     },
     {
         "name": "v3",
-        "signatures_any": ["A11","A12","B11","B12","C11","C12"],
-        "scale_prefixes": ["A","B","C"],
-        # v3 token: A11/B12/C24 這種
+        "signatures_any": ["A11", "A12", "B11", "B12", "C11", "C12"],
+        "scale_prefixes": ["A", "B", "C"],
         "item_token_regex": r"^([ABC]\d{2})\b",
     },
 ]
