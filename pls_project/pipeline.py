@@ -315,18 +315,29 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     df["_flag_careless"] = False
 
     def has_experience(x) -> bool:
-        if pd.isna(x):
-            return False
-        if isinstance(x, (int, float, np.integer, np.floating)):
-            return float(x) > 0
-        s = str(x).strip()
-        no_kw = ["沒有", "否", "不曾", "從未", "未", "無"]
-        yes_kw = ["有", "是", "曾", "使用過"]
-        if any(k in s for k in no_kw):
-            return False
-        if any(k in s for k in yes_kw):
-            return True
+    if pd.isna(x):
         return False
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x) > 0
+
+    s = str(x).strip()
+
+    # 明確否定
+    no_kw = ["沒有", "否", "不曾", "從未", "未", "無"]
+    if any(k in s for k in no_kw):
+        return False
+
+    # 只要看起來像「頻率/經驗」字串，就視為有（例如：1~2小時/天、3~4年）
+    if re.search(r"\d", s) and any(u in s for u in ["小時", "天", "週", "月", "年"]):
+        return True
+
+    # 明確肯定
+    yes_kw = ["有", "是", "曾", "使用過"]
+    if any(k in s for k in yes_kw):
+        return True
+
+    # 其他看不懂 → 預設 False（保守）
+    return False
 
     # 1) No experience
     if FILTER_NOEXP and (EXP_COL in df.columns):
