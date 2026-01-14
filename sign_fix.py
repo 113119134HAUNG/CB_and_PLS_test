@@ -1,11 +1,18 @@
+# pls_project/sign_fix.py
 from __future__ import annotations
+
 import pandas as pd
 
 def choose_anchors_by_max_abs_loading(X_df: pd.DataFrame, scores_df: pd.DataFrame, lv_blocks: dict) -> dict:
+    """
+    Choose one anchor indicator per LV by max |corr(item, LV score)|.
+    Used only for sign orientation; does not create new values.
+    """
     anchors = {}
     for lv, inds in lv_blocks.items():
         if lv not in scores_df.columns:
             continue
+
         best_it = None
         best_abs = -1.0
         for it in inds:
@@ -17,6 +24,8 @@ def choose_anchors_by_max_abs_loading(X_df: pd.DataFrame, scores_df: pd.DataFram
             if abs(r) > best_abs:
                 best_abs = abs(r)
                 best_it = it
+
         if best_it is not None:
             anchors[lv] = best_it
+
     return anchors
