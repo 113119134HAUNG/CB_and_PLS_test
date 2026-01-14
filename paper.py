@@ -177,7 +177,7 @@ def run_cfa(cog, df_valid, groups, group_items, item_cols):
     if not cfg.RUN_CFA:
         return (pd.DataFrame([{"RUN_CFA": False}]), pd.DataFrame(), pd.DataFrame())
 
-    # ✅ 建議：把安裝移到 pipeline/deps；這裡只 import
+    # 把安裝移到 pipeline/deps；這裡只 import
     try:
         from semopy import Model, calc_stats
     except Exception as e:
