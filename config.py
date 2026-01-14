@@ -79,7 +79,7 @@ class PLSConfig:
     # ---- Missing handling ----
     # clean 建議用 "none"（資料先處理好）或 "listwise"（刪掉含缺值列，不生成新數值）
     # 如果你自己明確想用 mean replacement，才設 "mean"
-    PLS_MISSING: str = "none"          # "none" | "listwise" | "mean"
+    PLS_MISSING: str = "listwise"          # "none" | "listwise" | "mean"
 
     # ---- Bootstrap / diagnostics (must be explicit; no retries) ----
     PLS_BOOT: int = 200
