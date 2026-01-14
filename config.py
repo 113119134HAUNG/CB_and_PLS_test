@@ -114,7 +114,8 @@ class PLSConfig:
     # ---- Correlation methods ----
     HTMT_CORR_METHOD: str = "pearson"
     PLS_CROSS_CORR_METHOD: str = "pearson"
-
+    PLS_MISSING: str = "listwise"   # "none" | "listwise" | "mean"
+    
     # ---- Sign orientation ----
     SIGN_FIX: bool = True
 
@@ -126,6 +127,8 @@ class PLSConfig:
     PLS_SEED: int = 0
     Q2_FOLDS: int = 5
     BOOT_RETRY: int = 0
+    BOOT_CI_LO: float = 0.025
+    BOOT_CI_HI: float = 0.975
 
     # ---- Model1 / Model2 control ----
     RUN_MODEL1: bool = True
