@@ -58,8 +58,8 @@ class ScaleConfig:
 class FilterConfig:
     # ---- NEW: 三個前處理開關 ----
     FILTER_NOEXP: bool = True
-    FILTER_DUPLICATE: bool = True
-    FILTER_CARELESS: bool = True
+    FILTER_DUPLICATE: bool = False
+    FILTER_CARELESS: bool = False
 
     # duplicate setting
     KEEP_DUP: str = "last"
