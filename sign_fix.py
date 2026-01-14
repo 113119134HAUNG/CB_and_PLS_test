@@ -12,7 +12,7 @@ def choose_anchors_by_max_abs_loading(X_df: pd.DataFrame, scores_df: pd.DataFram
         for it in inds:
             if it not in X_df.columns:
                 continue
-            r = X_df[it].corr(scores_df[lv])
+            r = X_df[it].corr(scores_df[lv], min_periods=3)
             if pd.isna(r):
                 continue
             if abs(r) > best_abs:
@@ -27,7 +27,7 @@ def sign_fix_scores_by_anchors(scores_df: pd.DataFrame, X_df: pd.DataFrame, anch
     for lv, a in anchors.items():
         if lv not in out.columns or a not in X_df.columns:
             continue
-        r = X_df[a].corr(out[lv])
+        r = X_df[a].corr(out[lv], min_periods=3)
         if pd.notna(r) and r < 0:
             out[lv] = -out[lv]
     return out
