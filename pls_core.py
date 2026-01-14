@@ -9,7 +9,6 @@ from typing import Dict, List, Tuple, Optional, Iterable, Any
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import KFold
-from sklearn.decomposition import PCA
 
 
 # =========================================================
@@ -58,7 +57,7 @@ def make_plspm_path(nodes_ordered: List[str], edges_from_to: List[Tuple[str, str
 
 
 # =========================================================
-# 1) plspm dependency + runner
+# 1) plspm dependency + runner (SmartPLS4-aligned, clean)
 # =========================================================
 def ensure_plspm(auto_install: bool = False):
     """
@@ -82,71 +81,23 @@ def ensure_plspm(auto_install: bool = False):
         return c, Plspm, Mode, Scheme
 
 
-def _zscore_df(X: pd.DataFrame) -> pd.DataFrame:
-    X = X.astype(float)
-    mu = X.mean(axis=0)
-    sd = X.std(axis=0, ddof=0).replace(0, np.nan)
-    return (X - mu) / sd
-
-
-def _scheme_to_plspm_scheme(s: str) -> str:
+def _scheme_to_plspm_scheme_strict(s: str) -> str:
     """
-    Map cfg scheme string to plspm Scheme attribute name.
-    SmartPLS4 offers PATH / FACTORIAL / PCA and removed CENTROID.
-    We keep CENTROID & PCA for backward compatibility (PCA is an approximation here).
+    SmartPLS4-aligned, clean:
+      - allow only PATH / FACTORIAL
+      - CENTROID not supported in SmartPLS4
+      - PCA option here would be an approximation -> disallow
     """
     s = (s or "").strip().upper()
-    if s in ("PATH", "PATH_WEIGHTING", "PATHWEIGHTING"):
+    if s in ("PATH", "PATH_WEIGHTING", "PATHWEIGHTING", ""):
         return "PATH"
     if s in ("FACTOR", "FACTORIAL", "FACTOR_WEIGHTING"):
         return "FACTORIAL"
     if s in ("CENTROID",):
-        return "CENTROID"
+        raise ValueError("PLS_SCHEME='CENTROID' is not available in SmartPLS4 (clean mode forbids it).")
     if s in ("PCA", "PRINCIPAL_COMPONENTS", "PRINCIPAL_COMPONENT_ANALYSIS"):
-        return "PCA"
-    return "PATH"
-
-
-def _pca_construct_scores(
-    X: pd.DataFrame,
-    lv_blocks: Dict[str, List[str]],
-    lv_modes: Dict[str, str],
-    scaled: bool = True,
-    seed: int = 0,
-) -> pd.DataFrame:
-    """
-    PCA option (approximation):
-      - per LV: first PCA component score from its indicators
-      - if scaled=True: z-score indicators first
-    NOTE: This is a pragmatic approximation for scores only.
-    """
-    Xuse = _zscore_df(X) if scaled else X.astype(float)
-    scores = {}
-    rng = np.random.default_rng(seed)
-
-    for lv, inds in lv_blocks.items():
-        cols = [c for c in inds if c in Xuse.columns]
-        if len(cols) == 0:
-            scores[lv] = np.full((len(Xuse),), np.nan)
-            continue
-
-        M = Xuse[cols].to_numpy()
-        if np.isnan(M).any():
-            col_mean = np.nanmean(M, axis=0)
-            col_mean = np.where(np.isfinite(col_mean), col_mean, 0.0)
-            inds_nan = np.where(np.isnan(M))
-            M[inds_nan] = np.take(col_mean, inds_nan[1])
-
-        pca = PCA(n_components=1, random_state=int(rng.integers(0, 2**31 - 1)))
-        s = pca.fit_transform(M).ravel()
-
-        load = pca.components_[0]
-        if np.nansum(load) < 0:
-            s = -s
-
-        scores[lv] = s
-
-    return pd.DataFrame(scores, index=X.index)
+        raise ValueError("PLS_SCHEME='PCA' is not allowed in clean mode (would be an approximation).")
+    raise ValueError(f"Unknown PLS_SCHEME: {s}")
 
 
 def run_plspm_python(
@@ -157,38 +108,28 @@ def run_plspm_python(
     lv_modes: Dict[str, str],
     *,
     scaled: bool = True,
-    auto_install: bool = False,
 ):
     """
-    PLS runner wrapper:
-      - scheme read from cog.cfg.pls.PLS_SCHEME (PATH/FACTORIAL/CENTROID/PCA)
-      - iterations/tolerance read from cog.cfg.pls.PLSPM_MAX_ITER / PLSPM_TOL
-      - if scheme == PCA: returns (None, scores_df) via PCA approximation
-
-    Returns: (model, scores_df)
+    Clean PLS runner:
+      - scheme from cfg.pls.PLS_SCHEME (PATH/FACTORIAL only)
+      - iterations/tolerance from cfg.pls.PLSPM_MAX_ITER / cfg.pls.PLSPM_TOL
+      - no retries with alternative hyperparams
+      - no PCA approximation branch
+      - optional auto-install controlled by cfg.pls.AUTO_INSTALL_PLSPM (if present), else False
     """
     cfg = cog.cfg.pls
-    scheme = _scheme_to_plspm_scheme(getattr(cfg, "PLS_SCHEME", "PATH"))
 
-    if scheme == "CENTROID":
-        warnings.warn(
-            "CENTROID scheme is not available in SmartPLS 4 (legacy option). "
-            "Use PATH (default) or FACTORIAL to align with SmartPLS4."
-        )
+    scheme = _scheme_to_plspm_scheme_strict(getattr(cfg, "PLS_SCHEME", "PATH"))
 
-    if scheme == "PCA":
-        scores = _pca_construct_scores(
-            X, lv_blocks=lv_blocks, lv_modes=lv_modes,
-            scaled=scaled, seed=int(getattr(cfg, "PLS_SEED", 0))
-        )
-        scores = scores.apply(pd.to_numeric, errors="coerce")
-        return None, scores
+    # Read required numeric settings from config (no hidden defaults)
+    if not hasattr(cfg, "PLSPM_MAX_ITER") or not hasattr(cfg, "PLSPM_TOL"):
+        raise AttributeError("Config.pls must define PLSPM_MAX_ITER and PLSPM_TOL (clean mode).")
+    iters = int(cfg.PLSPM_MAX_ITER)
+    tol = float(cfg.PLSPM_TOL)
 
+    auto_install = bool(getattr(cfg, "AUTO_INSTALL_PLSPM", False))
     c, Plspm, Mode, Scheme = ensure_plspm(auto_install=auto_install)
     scheme_obj = getattr(Scheme, scheme, Scheme.PATH)
-
-    iters = int(getattr(cfg, "PLSPM_MAX_ITER", 3000))
-    tol = float(getattr(cfg, "PLSPM_TOL", 1e-7))
 
     config = c.Config(path_df, scaled=bool(scaled))
     for lv, inds in lv_blocks.items():
@@ -304,7 +245,7 @@ def htmt_matrix(
 
 
 # =========================================================
-# 3) Model extraction + sign alignment helpers (your “must-do”)
+# 3) Model extraction + sign alignment helpers
 # =========================================================
 def _maybe_call(x):
     return x() if callable(x) else x
@@ -367,10 +308,16 @@ def apply_sign_to_outer(outer_df: pd.DataFrame, sign_map: dict) -> pd.DataFrame:
     return out
 
 
-def get_path_results(model, path_df: pd.DataFrame, *, strict: bool = True, scores_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def get_path_results(
+    model,
+    path_df: pd.DataFrame,
+    *,
+    strict: bool = True,
+    scores_df: Optional[pd.DataFrame] = None
+) -> pd.DataFrame:
     """
-    Prefer extracting path coefficients from plspm model;
-    if strict=False, fallback to OLS(scores) when unavailable.
+    Prefer extracting path coefficients from plspm model.
+    If strict=False, fallback to OLS(scores) when unavailable.
 
     Return long format: from,to,estimate
     """
@@ -392,7 +339,7 @@ def get_path_results(model, path_df: pd.DataFrame, *, strict: bool = True, score
         cols = {c.lower(): c for c in M.columns}
         if ("from" in cols and "to" in cols) and ("estimate" in cols or "path" in cols or "coef" in cols):
             est_col = cols.get("estimate") or cols.get("path") or cols.get("coef")
-            out = M.rename(columns={cols["from"]:"from", cols["to"]:"to", est_col:"estimate"})[["from","to","estimate"]]
+            out = M.rename(columns={cols["from"]: "from", cols["to"]: "to", est_col: "estimate"})[["from", "to", "estimate"]]
             keep = []
             for _, r in out.iterrows():
                 fr, to = r["from"], r["to"]
@@ -417,8 +364,8 @@ def get_outer_results(
     strict: bool = True,
 ) -> pd.DataFrame:
     """
-    Prefer extracting outer loadings/weights from plspm model;
-    if strict=False, fallback to corr(indicator, LVscore) for reflective loadings.
+    Prefer extracting outer loadings/weights from plspm model.
+    If strict=False, fallback to corr(indicator, LVscore) for reflective loadings.
 
     Return columns:
       Construct, Indicator, Mode, OuterLoading, OuterWeight, Communality(h2)
@@ -430,21 +377,21 @@ def get_outer_results(
     if OM is not None and not OM.empty:
         cols = {c.lower(): c for c in OM.columns}
         c_construct = cols.get("block") or cols.get("construct") or cols.get("lv") or cols.get("latent") or cols.get("name_lv")
-        c_ind      = cols.get("name") or cols.get("indicator") or cols.get("mv") or cols.get("manifest") or cols.get("name_mv")
-        c_loading  = cols.get("loading") or cols.get("outer_loading")
-        c_weight   = cols.get("weight") or cols.get("outer_weight")
+        c_ind = cols.get("name") or cols.get("indicator") or cols.get("mv") or cols.get("manifest") or cols.get("name_mv")
+        c_loading = cols.get("loading") or cols.get("outer_loading")
+        c_weight = cols.get("weight") or cols.get("outer_weight")
 
         if c_construct and c_ind:
             out = pd.DataFrame({
                 "Construct": OM[c_construct].astype(str),
                 "Indicator": OM[c_ind].astype(str),
                 "OuterLoading": pd.to_numeric(OM[c_loading], errors="coerce") if c_loading else np.nan,
-                "OuterWeight":  pd.to_numeric(OM[c_weight], errors="coerce") if c_weight else np.nan,
+                "OuterWeight": pd.to_numeric(OM[c_weight], errors="coerce") if c_weight else np.nan,
             })
             out["Mode"] = out["Construct"].map(lambda lv: str(lv_modes.get(lv, "A")).upper())
             out["Mode"] = out["Mode"].map(lambda m: "A(reflective)" if m == "A" else "B(formative)")
             out["Communality(h2)"] = pd.to_numeric(out["OuterLoading"], errors="coerce") ** 2
-            return out[["Construct","Indicator","Mode","OuterLoading","OuterWeight","Communality(h2)"]]
+            return out[["Construct", "Indicator", "Mode", "OuterLoading", "OuterWeight", "Communality(h2)"]]
 
     if strict:
         raise AttributeError("Cannot extract outer model (loadings/weights) from plspm model API.")
@@ -608,7 +555,6 @@ def effects_total_indirect(
         if u in out_adj:
             out_adj[u].append(v)
 
-    # reachable pairs
     pairs = []
     for s in order_nodes:
         reach = {n: 0.0 for n in order_nodes}
@@ -621,7 +567,6 @@ def effects_total_indirect(
                 pairs.append((s, t))
     pairs = list(dict.fromkeys(pairs))
 
-    # total effects
     total = {}
     for s in order_nodes:
         eff = {n: 0.0 for n in order_nodes}
