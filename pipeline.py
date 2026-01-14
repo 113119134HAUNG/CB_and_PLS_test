@@ -323,4 +323,44 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                             EFA1Fit[["Construct","n(complete)","k(items)","KMO","Bartlett_p"]], index=False)
 
         if cfg.cfa.RUN_CFA:
-            r = write_block(writer, c_
+            r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"E. CFA standardized loadings (all constructs together) [{tag}]", CFA_Loadings, index=False)
+            r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"F. CFA model info [{tag}]", CFA_Info, index=False)
+            r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"G. CFA fit indices [{tag}]", CFA_Fit, index=False)
+
+        ws.freeze_panes = "A2"
+
+        if cfg.pls.RUN_PLS:
+            ws_pls = get_or_create_ws(writer, cfg.io.PLS_SHEET)
+            rp = 0
+
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "MODEL 1 (Baseline): ACO / CCO separate", PLS1_info, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-A. Outer model (model API)", PLS1_outer, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-B. CR / AVE", PLS1_quality, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-C. HTMT", PLS1_htmt, index=True)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-D. Cross-loadings (LV scores corr)", PLS1_cross, index=True)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-X. R²", PLS1_R2, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Y. f² (per path)", PLS1_f2, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Z. Q²(CV)", PLS1_Q2, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-V. Structural VIF", PLS1_VIF, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-ZZ. Bootstrap DIRECT paths (t/CI/Sig)", PLS1_BOOTPATH, index=False)
+
+            rp += 2
+
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "MODEL 2 (Main): Commitment(formative) two-stage", PLS2_info, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-A. Commitment outer (model API)", PLS2_commitment, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-B. Outer model (model API)", PLS2_outer, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-C. CR / AVE", PLS2_quality, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-D. HTMT", PLS2_htmt, index=True)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-E. Cross-loadings (LV scores corr)", PLS2_cross, index=True)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-X. R²", PLS2_R2, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Y. f² (per path)", PLS2_f2, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Z. Q²(CV)", PLS2_Q2, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-V. Structural VIF", PLS2_VIF, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-ZZ. Bootstrap DIRECT paths (t/CI/Sig)", PLS2_BOOTPATH, index=False)
+
+            ws_pls.freeze_panes = "A2"
+
+    df_valid.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+    print("✅ 已輸出：", OUT_XLSX)
+    print("✅ 已輸出：", OUT_CSV)
+    return OUT_XLSX, OUT_CSV
