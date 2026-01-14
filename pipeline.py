@@ -367,7 +367,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         use_sd = bool(getattr(fcfg, "CARELESS_USE_SD", True))
         use_long = bool(getattr(fcfg, "CARELESS_USE_LONGSTRING", True))
 
-        cond = False
+        cond = cond = pd.Series(False, index=df.index)
         if use_miss:
             cond = cond | (miss_rate > cfg.filt.MAX_MISSING_RATE)
         if use_sd:
