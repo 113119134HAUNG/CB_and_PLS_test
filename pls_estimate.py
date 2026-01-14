@@ -1,7 +1,7 @@
 # pls_estimate.py
 import numpy as np
 import pandas as pd
-
+from typing import Optional, Dict
 from pls_project.pls_core import (
     run_plspm_python,
     corr_items_vs_scores,
@@ -34,44 +34,17 @@ def estimate_pls_basic_paper(
     lv_blocks: dict,
     lv_modes: dict,
     order: list[str],
+    anchor_overrides: Optional[Dict[str, str]] = None,   # ✅ NEW
 ):
-    """
-    One-shot clean output:
-      - plspm model API provides estimation (outer/path) [strict=True]
-      - cross-loadings by correlation (inspection only)
-      - sign orientation uses ONE sign_map for scores/outer/paths (no double-corr)
-      - NO extra scheme defaults here (scheme comes from Config via run_plspm_python)
-    """
-    cfg = cog.cfg.pls
-    dec = int(getattr(cfg, "PAPER_DECIMALS", 3))
-
-    cross_method = str(getattr(
-        cfg,
-        "PLS_CROSS_CORR_METHOD",
-        getattr(cfg, "HTMT_CORR_METHOD", "pearson")
-    ))
-
-    # 1) run model (scheme/iter/tol etc. come from Config inside run_plspm_python)
-    model, scores = run_plspm_python(
-        cog,
-        Xpls,
-        path_df,
-        lv_blocks,
-        lv_modes,
-        scaled=bool(getattr(cfg, "PLS_STANDARDIZED", True)),
-    )
-
-    # 2) strict LV alignment (no silent fallback)
-    missing = [lv for lv in order if lv not in scores.columns]
-    if missing:
-        raise KeyError(f"LV scores missing columns from plspm output: {missing}. "
-                       f"Available={list(scores.columns)}")
-    scores = scores[order].copy()
-
-    # 3) sign-fix (optional) — ONE sign_map controls everything
+    ...
     sign_fix_on = bool(getattr(cfg, "SIGN_FIX", True))
     if sign_fix_on:
         anchors = choose_anchors_by_max_abs_loading(Xpls, scores, lv_blocks)
+
+        # ✅ NEW: allow override (e.g., Commitment -> "CCO_score")
+        if anchor_overrides:
+            anchors.update(anchor_overrides)
+
         sign_map = get_sign_map_by_anchors(Xpls, scores, anchors)
         scores = _apply_sign_to_scores(scores, sign_map)
     else:
