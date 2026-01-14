@@ -4,8 +4,9 @@ from dataclasses import replace
 from typing import Sequence, Optional, Dict, List, Tuple
 import re
 import difflib
+import pandas as pd
 
-from .config import ColumnConfig
+from .config import Config, ColumnConfig
 from .rulebook import META_RULES, PROFILES
 
 def _norm_cols(columns: Sequence[str]) -> List[str]:
@@ -34,7 +35,6 @@ def _fuzzy(cols: List[str], hint: str) -> Optional[str]:
     return m[0] if m else None
 
 def resolve_columns(col_cfg: ColumnConfig, columns: Sequence[str]) -> ColumnConfig:
-    """把 ColumnConfig 用規則庫對到 df.columns 的實際欄名（無副作用）。"""
     cols = _norm_cols(columns)
 
     def pick(current: str, field: str) -> str:
@@ -76,12 +76,6 @@ def extract_item_token(colname: str, profile_name: str) -> Optional[str]:
     return m.group(1) if m else None
 
 def build_rename_map_for_items(columns: Sequence[str]) -> Tuple[str, Dict[str, str], List[str]]:
-    """
-    回傳：
-      profile_name
-      rename_map: 原欄名 -> token（只對可抽 token 的欄位）
-      scale_prefixes: 該版本的 prefix 清單
-    """
     cols = _norm_cols(columns)
     profile_name = detect_profile(cols)
     prof = next((p for p in PROFILES if p["name"] == profile_name), None)
@@ -94,3 +88,36 @@ def build_rename_map_for_items(columns: Sequence[str]) -> Tuple[str, Dict[str, s
 
     scale_prefixes = prof["scale_prefixes"] if prof else []
     return profile_name, rename_map, scale_prefixes
+
+
+# ==============================
+# ✅ 你要的：把解析結果「填充進 cfg」
+# ==============================
+def apply_schema_to_config(cfg: Config, df: pd.DataFrame, *, mutate_df: bool = True) -> pd.DataFrame:
+    """
+    1) normalize df.columns
+    2) 偵測版本、建立 rename_map，必要時把題項欄名 token 化（特別是 v2）
+    3) 解析 meta 欄位並寫回 cfg.cols
+    4) 寫回 cfg.runtime (profile/scale_prefixes/rename_map)
+    回傳：處理後的 df（若 mutate_df=True 則會回傳已改名的 df）
+    """
+    if not mutate_df:
+        df = df.copy()
+
+    # normalize columns once
+    df.columns = _norm_cols(df.columns)
+
+    # profile + rename tokens (v2)
+    profile_name, rename_map, scale_prefixes = build_rename_map_for_items(df.columns)
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # resolve meta columns based on (possibly renamed) df.columns
+    cfg.cols = resolve_columns(cfg.cols, df.columns)
+
+    # write runtime info back to cfg
+    cfg.runtime.profile_name = profile_name
+    cfg.runtime.scale_prefixes = scale_prefixes
+    cfg.runtime.rename_map = rename_map
+
+    return df
