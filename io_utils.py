@@ -2,7 +2,6 @@
 import re
 import pandas as pd
 import numpy as np
-from scipy.stats import norm
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
@@ -51,12 +50,30 @@ def reverse_1to5(x):
         return np.nan
     return 6 - v
 
-def safe_t_p(est: np.ndarray, se: np.ndarray):
+def safe_t(est: np.ndarray, se: np.ndarray):
+    """
+    Clean (distribution-free) t-statistic:
+      t = |estimate| / SE
+    No p-value is computed (avoids distributional assumptions).
+    """
     est = np.asarray(est, dtype=float)
     se  = np.asarray(se, dtype=float)
     t = np.divide(np.abs(est), se, out=np.full_like(est, np.nan), where=(se > 0))
-    p = np.where(np.isfinite(t), 2 * (1 - norm.cdf(t)), np.nan)
-    return t, p
+    return t
+
+def ci_sig(ci_l: np.ndarray, ci_u: np.ndarray):
+    """
+    CI-based significance (distribution-free):
+      significant if 0 is NOT inside [CI_l, CI_u]
+    Returns boolean array.
+    """
+    ci_l = np.asarray(ci_l, dtype=float)
+    ci_u = np.asarray(ci_u, dtype=float)
+    ok = np.isfinite(ci_l) & np.isfinite(ci_u)
+    sig = np.full_like(ci_l, False, dtype=bool)
+    # 0 not in interval => (ci_u < 0) or (ci_l > 0)
+    sig[ok] = (ci_u[ok] < 0) | (ci_l[ok] > 0)
+    return sig
 
 def get_or_create_ws(writer, sheet_name: str):
     if sheet_name in writer.book.sheetnames:
