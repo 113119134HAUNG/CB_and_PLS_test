@@ -54,15 +54,31 @@ class CFAConfig:
 @dataclass
 class PLSConfig:
     RUN_PLS: bool = True
-    PLS_MISSING: str = "mean"
-    PLS_SCHEME: str = "PATH"
-    HTMT_CORR_METHOD: str = "pearson"
+
+    # ---- Clean rules (no silent behavior) ----
+    CLEAN_MODE: bool = True            # 開啟：禁止 fallback / 禁止自動安裝 / 禁止近似
+    AUTO_INSTALL_PLSPM: bool = False   # 乾淨環境：不要在 pipeline pip install
+    ALLOW_FALLBACK: bool = False       # False = outer/path 一定要從 model API 取，取不到就報錯
+    ALLOW_PCA: bool = False            # False = 禁止你目前那段 PCA 近似分支
+
+    # ---- SmartPLS4 standard settings (explicit in config) ----
+    PLS_SCHEME: str = "PATH"           # SmartPLS4: PATH / FACTORIAL（不含 CENTROID）
+    PLS_STANDARDIZED: bool = True      # SmartPLS4 常用標準化結果
+
+    PLSPM_MAX_ITER: int = 3000         # SmartPLS4 對齊
+    PLSPM_TOL: float = 1e-7            # SmartPLS4 對齊
+
+    # ---- Missing handling ----
+    # clean 建議用 "none"（資料先處理好）或 "listwise"（刪掉含缺值列，不生成新數值）
+    # 如果你自己明確想用 mean replacement，才設 "mean"
+    PLS_MISSING: str = "none"          # "none" | "listwise" | "mean"
+
+    # ---- Bootstrap / diagnostics (must be explicit; no retries) ----
     PLS_BOOT: int = 200
     PLS_SEED: int = 0
     Q2_FOLDS: int = 5
-    PLSPM_MAX_ITER: int = 3000
-    PLSPM_TOL: float = 1e-7
-    BOOT_RETRY: int = 5
+
+    BOOT_RETRY: int = 0                # 乾淨：不重試，不偷偷換參數
 
 @dataclass
 class MGAConfig:
