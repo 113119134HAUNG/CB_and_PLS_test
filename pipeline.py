@@ -9,13 +9,20 @@ from pls_project.pls_core import (
     apply_sign_to_outer,
     apply_sign_to_paths,
     get_sign_map_by_anchors,
-    quality_paper_table,   # 你若還沒有，等一下我也給你版本
+    quality_paper_table,
 )
 
 from pls_project.sign_fix import (
     choose_anchors_by_max_abs_loading,
-    sign_fix_scores_by_anchors,
 )
+
+def _apply_sign_to_scores(scores_df: pd.DataFrame, sign_map: dict) -> pd.DataFrame:
+    """Flip LV scores using sign_map (+1/-1)."""
+    out = scores_df.copy()
+    for lv, s in sign_map.items():
+        if lv in out.columns and int(s) == -1:
+            out[lv] = -out[lv]
+    return out
 
 def estimate_pls_basic_paper(
     cog,
@@ -28,14 +35,17 @@ def estimate_pls_basic_paper(
     order: list[str],
 ):
     """
-    Clean + SmartPLS4-aligned:
-      - estimation from plspm model API only (outer/path)
-      - no OLS(paths) fallback, no corr(outer) fallback
-      - sign-fix optional (cfg.pls.SIGN_FIX)
-      - paper tables returned
+    One-shot clean output (SmartPLS4-aligned spirit):
+      - outer/path strictly from plspm model API
+      - cross-loadings by correlation (inspection only)
+      - sign alignment uses ONE sign_map for scores/outer/paths (no double-corr)
     """
     cfg = cog.cfg.pls
     dec = int(getattr(cfg, "PAPER_DECIMALS", 3))
+
+    # cross-loadings correlation method (separate from HTMT if you want)
+    cross_method = str(getattr(cfg, "PLS_CROSS_CORR_METHOD",
+                               getattr(cfg, "HTMT_CORR_METHOD", "pearson")))
 
     # 1) run model
     model, scores = run_plspm_python(
@@ -48,24 +58,30 @@ def estimate_pls_basic_paper(
         scheme=str(getattr(cfg, "PLS_SCHEME", "PATH")),
     )
 
-    # 2) strict LV alignment (乾淨：不允許 fallback 用前幾欄)
+    # 2) strict LV alignment (no silent fallback)
     missing = [lv for lv in order if lv not in scores.columns]
     if missing:
-        raise KeyError(f"LV scores missing columns from plspm output: {missing}")
+        raise KeyError(f"LV scores missing columns from plspm output: {missing}. "
+                       f"Available={list(scores.columns)}")
     scores = scores[order].copy()
 
-    # 3) sign-fix (optional)
+    # 3) sign-fix (optional) — ONE sign_map for everything
     sign_fix_on = bool(getattr(cfg, "SIGN_FIX", True))
     if sign_fix_on:
         anchors = choose_anchors_by_max_abs_loading(Xpls, scores, lv_blocks)
         sign_map = get_sign_map_by_anchors(Xpls, scores, anchors)
-        scores = sign_fix_scores_by_anchors(scores, Xpls, anchors)
+        scores = _apply_sign_to_scores(scores, sign_map)
     else:
         anchors = {}
         sign_map = {}
 
-    # 4) cross-loadings (corr; inspection only)
-    PLS_cross = corr_items_vs_scores(Xpls[item_cols], scores[order], method=str(getattr(cfg, "HTMT_CORR_METHOD", "pearson"))).round(dec)
+    # 4) cross-loadings (inspection only)
+    PLS_cross = corr_items_vs_scores(
+        Xpls[item_cols],
+        scores[order],
+        method=cross_method
+    ).round(dec)
+    PLS_cross.index.name = "Item"
 
     # 5) outer results: STRICT from model API
     outer = get_outer_results(
@@ -91,7 +107,7 @@ def estimate_pls_basic_paper(
     key = pe[["from", "to"]].copy()
     est = pe["estimate"].astype(float).values
 
-    out = {
+    return {
         "model": model,
         "scores": scores.round(dec),
         "anchors": anchors,
@@ -103,4 +119,3 @@ def estimate_pls_basic_paper(
         "key": key,
         "est": est,
     }
-    return out
