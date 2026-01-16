@@ -43,6 +43,10 @@ def run_measureq(
 
         df_items.to_csv(data_csv, index=False, encoding="utf-8-sig")
 
+        # ---- write model to file (avoid multi-line string literal issues in R) ----
+        model_file = td / "model_measureq.txt"
+        model_file.write_text(model_syntax, encoding="utf-8")
+
         # IMPORTANT: pass HTMT as boolean (not a quoted string)
         cluster_arg = f', cluster="{cluster}"' if cluster else ""
         htmt_arg = "TRUE" if htmt else "FALSE"
@@ -58,7 +62,7 @@ def run_measureq(
           if (! (v %in% names(Data))) stop(paste0("Missing item column: ", v))
         }}
 
-        Model <- '{model_syntax.replace("'", '"')}'
+        Model <- paste(readLines("{model_file.as_posix()}", warn=FALSE), collapse="\\n")
 
         # capture console output
         sink(file.path("{out_dir.as_posix()}", "measureQ_console.txt"))
