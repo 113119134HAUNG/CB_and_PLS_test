@@ -45,7 +45,7 @@ from pls_project.cbsem_wlsmv import run_cbsem_esem_then_cfa_sem_wlsmv
 from pls_project.measureq_mlr import run_measureq
 from pls_project.cmv_clf_mlr import run_cmv_clf_mlr
 
-# ✅ inference modules (NEW)
+# inference modules
 from pls_project.effects_inference import edges_from_path_df, summarize_effects_bootstrap_ci
 from pls_project.htmt_inference import htmt_inference_bootstrap
 from pls_project.pls_predict import plspredict_indicator_cv
@@ -531,7 +531,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         use_sd = bool(getattr(fcfg, "CARELESS_USE_SD", True))
         use_long = bool(getattr(fcfg, "CARELESS_USE_LONGSTRING", True))
 
-        # ✅ jump filter switches
         use_jump = bool(getattr(fcfg, "USE_JUMP_FILTER", False))
         jump_diff = float(getattr(fcfg, "JUMP_DIFF", 3))
         jump_rate_th = float(getattr(fcfg, "JUMP_RATE_TH", 0.80))
@@ -715,11 +714,9 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
     PLS1_BOOTPATH = PLS2_BOOTPATH = pd.DataFrame()
 
-    # ✅ NEW: paths_long export tables
     PLS1_PATHS = pd.DataFrame()
     PLS2_PATHS = pd.DataFrame()
 
-    # ✅ NEW: inference outputs
     PLS1_EFF_POINT = PLS1_EFF_CI = PLS1_MED = pd.DataFrame()
     PLS2_EFF_POINT = PLS2_EFF_CI = PLS2_MED = pd.DataFrame()
 
@@ -773,7 +770,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         RUN_M1 = bool(getattr(cfg.pls, "RUN_MODEL1", True))
         RUN_M2 = bool(getattr(cfg.pls, "RUN_MODEL2", True))
 
-        # ✅ inference switches (default ON; can override in config)
         RUN_EFFECTS = bool(getattr(cfg.pls, "RUN_EFFECTS_INFERENCE", True))
         RUN_HTMT_INF = bool(getattr(cfg.pls, "RUN_HTMT_INFERENCE", True))
         RUN_PREDICT = bool(getattr(cfg.pls, "RUN_PLS_PREDICT", True))
@@ -825,7 +821,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 scores1 = res1["scores"]
                 PLS1_PATHS = res1.get("paths_long", pd.DataFrame()).copy()
 
-                # htmt_matrix no longer rounds internally; round at output layer
                 PLS1_htmt = htmt_matrix(
                     Xpls[item_cols],
                     {g: lv_blocks1[g] for g in order1},
@@ -849,9 +844,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         power=GP_POWER,
                     )
 
-                # ==============================
-                # MICOM (before MGA)
-                # ==============================
+                # MICOM
                 RUN_MICOM = bool(getattr(cfg.mga, "RUN_MICOM", False))
                 if RUN_MICOM:
                     split_vars = list(getattr(cfg.mga, "MICOM_SPLITS", getattr(cfg.mga, "MGA_SPLITS", [])))
@@ -868,13 +861,11 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         standardized=True,
                     )
 
-                    # numeric 判斷：有效數值比例門檻（避免類別欄全變 NaN 還被當 numeric）
                     num_ratio_th = float(getattr(cfg.mga, "MICOM_NUMERIC_RATIO_TH", 0.80))
 
                     for sv in split_vars:
                         sv = str(sv)
 
-                        # choose split source: LV scores first, then meta columns
                         if (scores1 is not None) and (sv in scores1.columns):
                             v = pd.to_numeric(scores1[sv], errors="coerce")
                             src = "LV_score"
@@ -929,9 +920,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         except Exception as e:
                             MICOM_out[sv] = {"info": pd.DataFrame([{"Error": f"MICOM failed ({sv}): {e}"}])}
 
-                # ==============================
-                # ✅ Inference (Model1)
-                # ==============================
+                # Inference (Model1): HTMT CI + PLSpredict
                 if RUN_HTMT_INF:
                     try:
                         PLS1_HTMTINF_DETAIL, PLS1_HTMTINF_SUM = htmt_inference_bootstrap(
@@ -1136,9 +1125,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
                         PLS2_commitment = PLS2_outer[PLS2_outer["Construct"] == commitment].copy()
 
-                        # ==============================
-                        # ✅ Inference (Model2)
-                        # ==============================
+                        # Inference (Model2): HTMT CI + PLSpredict
                         if RUN_HTMT_INF and refl2:
                             try:
                                 PLS2_HTMTINF_DETAIL, PLS2_HTMTINF_SUM = htmt_inference_bootstrap(
