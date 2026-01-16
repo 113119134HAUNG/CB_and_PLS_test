@@ -30,7 +30,6 @@ def htmt_inference_bootstrap(
     rng = np.random.default_rng(int(seed))
     G = list(groups)
 
-    # point estimate
     ht0 = htmt_matrix(X, group_items, G, method=corr_method)
 
     pairs = []
