@@ -9,6 +9,7 @@ import pandas as pd
 
 from pls_project.schema import resolve_schema
 from pls_project.io_utils import to_score, reverse_1to5, get_or_create_ws, write_block
+
 from pls_project.paper import (
     reliability_summary,
     item_analysis_table,
@@ -16,6 +17,7 @@ from pls_project.paper import (
     one_factor_efa_table,
     run_cfa,
 )
+
 from pls_project.pls_core import (
     topo_sort,
     make_plspm_path,
@@ -23,16 +25,85 @@ from pls_project.pls_core import (
     r2_f2_from_scores,
     q2_cv_from_scores,
     structural_vif,
+    ols_fit,  # NEW: for full collinearity VIF
     # bootstrap needs these:
     run_plspm_python,
     get_path_results,
     apply_sign_to_paths,
     get_sign_map_by_anchors,
 )
+
 from pls_project.pls_estimate import estimate_pls_basic_paper
 from pls_project.pls_bootstrap import summarize_direct_ci
+
 from pls_project.cbsem_wlsmv import run_cbsem_esem_then_cfa_sem_wlsmv
 from pls_project.measureq_mlr import run_measureq
+
+
+# =========================================================
+# NEW: Full collinearity VIF (CMV diagnostic) on LV scores
+# =========================================================
+def full_collinearity_vif(
+    scores_df: pd.DataFrame,
+    *,
+    threshold: float = 3.3,
+    decimals: int = 3,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Full collinearity VIF (CMV check) using LV scores:
+      For each construct y: regress y on all other constructs -> R2 -> VIF = 1/(1-R2)
+
+    Returns:
+      summary_df: Max VIF and pass/fail
+      detail_df: per-construct VIF
+    """
+    if scores_df is None or scores_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    cols = [c for c in scores_df.columns if c in scores_df.columns]
+    rows = []
+
+    for y in cols:
+        Xcols = [c for c in cols if c != y]
+        if len(Xcols) == 0:
+            continue
+
+        yv = pd.to_numeric(scores_df[y], errors="coerce").to_numpy()
+        Xv = scores_df[Xcols].apply(pd.to_numeric, errors="coerce").to_numpy()
+
+        # drop rows with NaN
+        ok = np.isfinite(yv) & np.isfinite(Xv).all(axis=1)
+        if ok.sum() < max(5, len(Xcols) + 2):
+            r2 = np.nan
+            vif = np.nan
+        else:
+            _, r2 = ols_fit(yv[ok], Xv[ok])
+            vif = (1.0 / (1.0 - r2)) if (pd.notna(r2) and (1.0 - r2) > 1e-12) else np.inf
+
+        rows.append({
+            "Construct": y,
+            "R2_on_others": r2,
+            "VIF_full": vif,
+            "Threshold": float(threshold),
+            "Pass(VIF<=TH)": (pd.notna(vif) and np.isfinite(vif) and (vif <= threshold)),
+        })
+
+    detail = pd.DataFrame(rows)
+    if detail.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    max_vif = pd.to_numeric(detail["VIF_full"], errors="coerce").max()
+    pass_all = bool((pd.to_numeric(detail["VIF_full"], errors="coerce") <= threshold).fillna(False).all())
+
+    summary = pd.DataFrame([{
+        "Max_VIF_full": max_vif,
+        "Threshold": float(threshold),
+        "Pass_all(VIF<=TH)": pass_all,
+        "Note": "Full collinearity VIF is commonly used as a CMV diagnostic on LV scores.",
+    }])
+
+    return summary.round(decimals), detail.round(decimals)
+
 
 def _apply_sign_to_scores(scores_df: pd.DataFrame, sign_map: dict) -> pd.DataFrame:
     """Flip LV scores using sign_map (+1/-1)."""
@@ -255,8 +326,9 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     USER_COL = resolved_cols.get("USER_COL", cfg.cols.USER_COL)
     EMAIL_COL = resolved_cols.get("EMAIL_COL", cfg.cols.EMAIL_COL)
     EXP_COL = resolved_cols.get("EXP_COL", cfg.cols.EXP_COL)
+
     EXP_COL_EXPER = "使用AI工具來學習之經驗"
-    EXP_COL_FREQ  = "使用AI工具來學習之頻率"
+    EXP_COL_FREQ = "使用AI工具來學習之頻率"
     if EXP_COL in df.columns and ("頻率" in str(EXP_COL)) and (EXP_COL_EXPER in df.columns):
         EXP_COL = EXP_COL_EXPER
 
@@ -383,7 +455,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         use_sd = bool(getattr(fcfg, "CARELESS_USE_SD", True))
         use_long = bool(getattr(fcfg, "CARELESS_USE_LONGSTRING", True))
 
-        cond = cond = pd.Series(False, index=df.index)
+        cond = pd.Series(False, index=df.index)
         if use_miss:
             cond = cond | (miss_rate > cfg.filt.MAX_MISSING_RATE)
         if use_sd:
@@ -426,25 +498,34 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     EFA1Table, EFA1Fit = one_factor_efa_table(cog, df_valid, groups, group_items)
     CFA_Loadings, CFA_Info, CFA_Fit = run_cfa(cog, df_valid, groups, group_items, item_cols)
 
-        # ==============================
+    # ==============================
     # CB-SEM line 1: ESEM -> CFA/SEM (ordered/WLSMV)
     # ==============================
-    CBSEM = {"info": pd.DataFrame(), "ESEM_fit": pd.DataFrame(), "ESEM_loadings": pd.DataFrame(),
-             "CFA_fit": pd.DataFrame(), "CFA_loadings": pd.DataFrame(), "SEM_fit": pd.DataFrame(), "SEM_paths": pd.DataFrame()}
+    CBSEM = {
+        "info": pd.DataFrame(),
+        "ESEM_fit": pd.DataFrame(),
+        "ESEM_loadings": pd.DataFrame(),
+        "CFA_fit": pd.DataFrame(),
+        "CFA_loadings": pd.DataFrame(),
+        "SEM_fit": pd.DataFrame(),
+        "SEM_paths": pd.DataFrame(),
+    }
+
     if bool(getattr(cfg.cfa, "RUN_CBSEM_WLSMV", False)):
         try:
             df_cb = df_valid[item_cols].copy()
 
-            nf = int(getattr(cfg.cfa, "ESEM_NFACTORS", len(groups)))
+            nf = int(getattr(cfg.cfa, "ESEM_NFACTORS", 0))
+            if nf <= 0:
+                nf = len(groups)
+
             rotation = str(getattr(cfg.cfa, "ESEM_ROTATION", "geomin"))
             missing = str(getattr(cfg.cfa, "CBSEM_MISSING", "listwise"))
 
-            # SEM edges: prefer cfg.cfa.SEM_EDGES, else reuse cfg.pls.MODEL1_EDGES
             sem_edges = list(getattr(cfg.cfa, "SEM_EDGES", []))
             if not sem_edges:
                 sem_edges = list(getattr(cfg.pls, "MODEL1_EDGES", []))
 
-            # keep only detected groups
             sem_edges = [(a, b) for (a, b) in sem_edges if (a in groups and b in groups)]
             run_sem = bool(getattr(cfg.cfa, "RUN_SEM_WLSMV", True))
 
@@ -473,13 +554,11 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             }
 
     # ==============================
-    # CB-SEM line 2: measureQ best-practice (MLR/FIML/boot as measureQ implements)
+    # CB-SEM line 2: measureQ best-practice (MLR robustness)
     # ==============================
     MQ = {"info": pd.DataFrame(), "measureQ_log": pd.DataFrame()}
     if bool(getattr(cfg.cfa, "RUN_MEASUREQ", False)):
         try:
-            # measurement model (same simple-structure CFA model as default)
-            # measureQ expects a measurement model syntax string
             model_lines = []
             for g in groups:
                 its = group_items.get(g, [])
@@ -505,8 +584,14 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     # ==============================
     PLS1_info = PLS1_outer = PLS1_quality = PLS1_htmt = PLS1_cross = pd.DataFrame()
     PLS2_info = PLS2_outer = PLS2_quality = PLS2_htmt = PLS2_cross = PLS2_commitment = pd.DataFrame()
+
     PLS1_R2 = PLS1_f2 = PLS1_Q2 = PLS1_VIF = pd.DataFrame()
     PLS2_R2 = PLS2_f2 = PLS2_Q2 = PLS2_VIF = pd.DataFrame()
+
+    # NEW: full collinearity VIF outputs
+    PLS1_CMV_SUM = PLS1_VIF_FULL = pd.DataFrame()
+    PLS2_CMV_SUM = PLS2_VIF_FULL = pd.DataFrame()
+
     PLS1_BOOTPATH = PLS2_BOOTPATH = pd.DataFrame()
 
     if cfg.pls.RUN_PLS:
@@ -534,6 +619,11 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             raise ValueError(f"Unknown PLS_MISSING: {cfg.pls.PLS_MISSING}")
 
         Xpls = Xpls.reset_index(drop=True)
+
+        # Full collinearity VIF controls (NEW, safe defaults)
+        RUN_FULL_VIF = bool(getattr(cfg.pls, "RUN_FULL_COLLINEARITY_VIF", True))
+        FULL_VIF_TH = float(getattr(cfg.pls, "FULL_VIF_THRESHOLD", 3.3))
+        DEC = int(getattr(cfg.pls, "PAPER_DECIMALS", 3))
 
         # --------------------------
         # Model1 (config-controlled)
@@ -591,6 +681,14 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 PLS1_Q2 = q2_cv_from_scores(scores1[order1], path1, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
                 PLS1_VIF = structural_vif(scores1[order1], path1)
 
+                # NEW: Full collinearity VIF (CMV check) — model must have scores
+                if RUN_FULL_VIF:
+                    PLS1_CMV_SUM, PLS1_VIF_FULL = full_collinearity_vif(
+                        scores1[order1],
+                        threshold=FULL_VIF_TH,
+                        decimals=DEC,
+                    )
+
                 PLS1_info = pd.DataFrame([{
                     "Model": f"Model1 [{tag}]",
                     "profile": profile_name,
@@ -600,6 +698,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                     "missing": cfg.pls.PLS_MISSING,
                     "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
                     "B(bootstrap)": int(cfg.pls.PLS_BOOT),
+                    "CMV_fullVIF_th": FULL_VIF_TH if RUN_FULL_VIF else "",
                     "estimates": "outer/path from plspm model API (strict)",
                 }])
 
@@ -615,6 +714,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         anchors=res1["anchors"],
                     )
                     PLS1_BOOTPATH = summarize_direct_ci(cog, res1["key"], res1["est"], boot1)
+
         else:
             PLS1_info = pd.DataFrame([{
                 "Info": "Model1 disabled by config (RUN_MODEL1=False).",
@@ -640,7 +740,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                     raise ValueError("MODEL2_COMPONENT_LVS and MODEL2_COMPONENT_COLS must have the same length.")
                 commitment_anchor = getattr(cfg.pls, "MODEL2_COMMITMENT_ANCHOR", None)
 
-                # check component LVs exist in Model1 scores
                 missing_comp = [lv for lv in comp_lvs if lv not in scores1.columns]
                 if missing_comp:
                     PLS2_info = pd.DataFrame([{
@@ -652,8 +751,10 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                     raise ValueError("Model2 blocked: stage1 component scores contain NaN (clean mode forbids fillna).")
                 else:
                     edges2_all = list(getattr(cfg.pls, "MODEL2_EDGES", []))
+
                     def ok_node(x: str) -> bool:
                         return (x in groups) or (x == commitment)
+
                     edges2 = [(a, b) for (a, b) in edges2_all if ok_node(a) and ok_node(b)]
 
                     nodes2 = sorted({x for e in edges2 for x in e if x != commitment}, key=lambda x: groups.index(x) if x in groups else 999)
@@ -722,6 +823,14 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         PLS2_Q2 = q2_cv_from_scores(scores2[order2], path2, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
                         PLS2_VIF = structural_vif(scores2[order2], path2)
 
+                        # NEW: Full collinearity VIF for Model2 as well
+                        if RUN_FULL_VIF:
+                            PLS2_CMV_SUM, PLS2_VIF_FULL = full_collinearity_vif(
+                                scores2[order2],
+                                threshold=FULL_VIF_TH,
+                                decimals=DEC,
+                            )
+
                         PLS2_commitment = PLS2_outer[PLS2_outer["Construct"] == commitment].copy()
 
                         PLS2_info = pd.DataFrame([{
@@ -735,6 +844,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                             "B(bootstrap)": int(cfg.pls.PLS_BOOT),
                             "commitment": commitment,
                             "components": ",".join(comp_lvs),
+                            "CMV_fullVIF_th": FULL_VIF_TH if RUN_FULL_VIF else "",
                             "estimates": "outer/path from plspm model API (strict)",
                         }])
 
@@ -758,6 +868,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                                 key2=res2["key"],
                             )
                             PLS2_BOOTPATH = summarize_direct_ci(cog, res2["key"], res2["est"], boot2)
+
         else:
             PLS2_info = pd.DataFrame([{
                 "Info": "Model2 disabled by config (RUN_MODEL2=False).",
@@ -772,27 +883,32 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         if cfg.io.EXPORT_EXCLUDED_SHEET and (excluded_df is not None) and (not excluded_df.empty):
             excluded_df.to_excel(writer, sheet_name="排除樣本", index=False)
 
+        # ---- Paper sheet ----
         ws = get_or_create_ws(writer, cfg.io.PAPER_SHEET)
         r = 0
         r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"A. Reliability summary (α / ωt) [{tag}]", RelTable, index=False)
+
         r = write_block(
             writer, cfg.io.PAPER_SHEET, ws, r,
             f"B. Item analysis (all constructs stacked) [{tag}]",
             ItemTable[["Construct", "Item", "n(complete)", "Mean", "SD", "CITC", "α if deleted", "ωt if deleted"]],
             index=False,
         )
+
         r = write_block(
             writer, cfg.io.PAPER_SHEET, ws, r,
             f"C. One-factor loadings (sklearn FA, all constructs stacked) [{tag}]",
             FA1Table[["Construct", "Item", "n(complete)", "Loading", "h2", "psi"]],
             index=False,
         )
+
         r = write_block(
             writer, cfg.io.PAPER_SHEET, ws, r,
             f"D. One-factor EFA per construct (factor_analyzer, all constructs stacked) [{tag}]",
             EFA1Table[["Construct", "Item", "n(complete)", "EFA Loading", "h2", "psi"]],
             index=False,
         )
+
         if EFA1Fit is not None and (not EFA1Fit.empty):
             r = write_block(
                 writer, cfg.io.PAPER_SHEET, ws, r,
@@ -808,9 +924,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
         ws.freeze_panes = "A2"
 
-                # ==============================
-        # Extra sheets: CBSEM_WLSMV (ESEM->CFA/SEM) and MEASUREQ
-        # ==============================
+        # ---- Extra sheets: CBSEM_WLSMV and MEASUREQ ----
         if bool(getattr(cfg.cfa, "RUN_CBSEM_WLSMV", False)):
             cb_sheet = str(getattr(cfg.io, "CBSEM_SHEET", "CBSEM_WLSMV"))
             ws_cb = get_or_create_ws(writer, cb_sheet)
@@ -830,17 +944,17 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             rm = 0
             rm = write_block(writer, mq_sheet, ws_mq, rm, f"measureQ INFO [{tag}]", MQ.get("info", pd.DataFrame()), index=False)
 
-            # Write any exported tables (measureQ_*), plus console log
-            # (tables are dynamic depending on measureQ version/settings)
             keys = [k for k in MQ.keys() if k not in ("info",)]
             for k in keys:
                 rm = write_block(writer, mq_sheet, ws_mq, rm, f"{k} [{tag}]", MQ.get(k, pd.DataFrame()), index=False)
 
             ws_mq.freeze_panes = "A2"
 
+        # ---- PLS sheet ----
         if cfg.pls.RUN_PLS:
             ws_pls = get_or_create_ws(writer, cfg.io.PLS_SHEET)
             rp = 0
+
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "MODEL 1", PLS1_info, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-A. Outer model (model API)", PLS1_outer, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-B. CR / AVE", PLS1_quality, index=False)
@@ -850,6 +964,11 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Y. f² (per path)", PLS1_f2, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Z. Q²(CV)", PLS1_Q2, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-V. Structural VIF", PLS1_VIF, index=False)
+
+            # NEW: CMV Full collinearity VIF
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-CMV. Full collinearity VIF summary", PLS1_CMV_SUM, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-CMV. Full collinearity VIF detail", PLS1_VIF_FULL, index=False)
+
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-ZZ. Bootstrap DIRECT paths (t/CI/Sig)", PLS1_BOOTPATH, index=False)
 
             rp += 2
@@ -864,6 +983,11 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Y. f² (per path)", PLS2_f2, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Z. Q²(CV)", PLS2_Q2, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-V. Structural VIF", PLS2_VIF, index=False)
+
+            # NEW: CMV Full collinearity VIF
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-CMV. Full collinearity VIF summary", PLS2_CMV_SUM, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-CMV. Full collinearity VIF detail", PLS2_VIF_FULL, index=False)
+
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-ZZ. Bootstrap DIRECT paths (t/CI/Sig)", PLS2_BOOTPATH, index=False)
 
             ws_pls.freeze_panes = "A2"
