@@ -307,4 +307,97 @@ def micom_two_group(
         for lv in order:
             if lv not in Sp.columns:
                 continue
-            v = Sp[lv].to_numpy(dtype=float)_
+            v = Sp[lv].to_numpy(dtype=float)
+            m1p = float(np.nanmean(v[g1p]))
+            m2p = float(np.nanmean(v[~g1p]))
+            v1p = float(np.nanvar(v[g1p], ddof=1))
+            v2p = float(np.nanvar(v[~g1p], ddof=1))
+            perm_diffs_mean[lv].append(m1p - m2p)
+            perm_diffs_var[lv].append(v1p - v2p)
+
+    # compute observed + p/CI
+    g1 = group_mask
+    for lv in order:
+        if lv not in Sp.columns:
+            step3_rows.append({
+                "Construct": lv,
+                "mean_diff(g1-g2)": np.nan,
+                "mean_ci_lo": np.nan,
+                "mean_ci_hi": np.nan,
+                "mean_p_two": np.nan,
+                "Pass_mean": False,
+                "var_diff(g1-g2)": np.nan,
+                "var_ci_lo": np.nan,
+                "var_ci_hi": np.nan,
+                "var_p_two": np.nan,
+                "Pass_var": False,
+            })
+            continue
+
+        v = Sp[lv].to_numpy(dtype=float)
+        mean_diff = float(np.nanmean(v[g1]) - np.nanmean(v[~g1]))
+        var_diff = float(np.nanvar(v[g1], ddof=1) - np.nanvar(v[~g1], ddof=1))
+
+        pm = np.asarray(perm_diffs_mean[lv], dtype=float)
+        pv = np.asarray(perm_diffs_var[lv], dtype=float)
+
+        # two-tailed p
+        mean_p = float(np.mean(np.abs(pm) >= abs(mean_diff))) if pm.size else np.nan
+        var_p = float(np.mean(np.abs(pv) >= abs(var_diff))) if pv.size else np.nan
+
+        mean_ci_lo, mean_ci_hi = (float(np.quantile(pm, alpha / 2)), float(np.quantile(pm, 1 - alpha / 2))) if pm.size else (np.nan, np.nan)
+        var_ci_lo, var_ci_hi = (float(np.quantile(pv, alpha / 2)), float(np.quantile(pv, 1 - alpha / 2))) if pv.size else (np.nan, np.nan)
+
+        pass_mean = bool((mean_ci_lo <= 0 <= mean_ci_hi)) if np.isfinite(mean_ci_lo) and np.isfinite(mean_ci_hi) else False
+        pass_var = bool((var_ci_lo <= 0 <= var_ci_hi)) if np.isfinite(var_ci_lo) and np.isfinite(var_ci_hi) else False
+
+        step3_rows.append({
+            "Construct": lv,
+            "mean_diff(g1-g2)": mean_diff,
+            "mean_ci_lo": mean_ci_lo,
+            "mean_ci_hi": mean_ci_hi,
+            "mean_p_two": mean_p,
+            "Pass_mean": pass_mean,
+            "var_diff(g1-g2)": var_diff,
+            "var_ci_lo": var_ci_lo,
+            "var_ci_hi": var_ci_hi,
+            "var_p_two": var_p,
+            "Pass_var": pass_var,
+        })
+
+    step3 = pd.DataFrame(step3_rows)
+
+    # summary: partial/full invariance
+    summary_rows = []
+    for lv in order:
+        pass_comp = bool(step2.loc[step2["Construct"] == lv, "Pass_compositional"].iloc[0]) if (step2["Construct"] == lv).any() else False
+        pass_mean = bool(step3.loc[step3["Construct"] == lv, "Pass_mean"].iloc[0]) if (step3["Construct"] == lv).any() else False
+        pass_var = bool(step3.loc[step3["Construct"] == lv, "Pass_var"].iloc[0]) if (step3["Construct"] == lv).any() else False
+        summary_rows.append({
+            "Construct": lv,
+            "Configural": True,
+            "Compositional": pass_comp,
+            "Mean_equal": pass_mean,
+            "Var_equal": pass_var,
+            "Partial_invariance": bool(True and pass_comp),
+            "Full_invariance": bool(True and pass_comp and pass_mean and pass_var),
+        })
+    summary = pd.DataFrame(summary_rows)
+
+    info = pd.DataFrame([{
+        "MICOM_steps": "1) configural, 2) compositional (permutation), 3) mean/variance (permutation)",
+        "n_group1": n1,
+        "n_group2": n2,
+        "B": int(settings.B),
+        "alpha": float(settings.alpha),
+        "standardized_scoring": bool(settings.standardized),
+        "note": "Follow MICOM 3-step logic as described by Henseler et al. and SmartPLS docs.",
+    }])
+
+    return {
+        "info": info,
+        "step1_configural": step1,
+        "step2_compositional": step2,
+        "step3_means_vars": step3,
+        "summary": summary,
+    }
