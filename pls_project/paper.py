@@ -52,7 +52,11 @@ def mcdonald_omega_total(items_df: pd.DataFrame, seed: int = 0) -> float:
         if np.any(~np.isfinite(uniq)) or np.any(uniq <= 0):
             return np.nan
 
-        lam = np.abs(loadings)
+        loadings = fa.components_.T[:, 0]
+        if np.nansum(loadings) < 0:
+            loadings = -loadings
+        lam = loadings
+        
         return float((lam.sum() ** 2) / ((lam.sum() ** 2) + uniq.sum()))
     except Exception:
         return np.nan
