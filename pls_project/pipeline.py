@@ -31,7 +31,8 @@ from pls_project.pls_core import (
 )
 from pls_project.pls_estimate import estimate_pls_basic_paper
 from pls_project.pls_bootstrap import summarize_direct_ci
-
+from pls_project.cbsem_wlsmv import run_cbsem_esem_then_cfa_sem_wlsmv
+from pls_project.measureq_mlr import run_measureq
 
 def _apply_sign_to_scores(scores_df: pd.DataFrame, sign_map: dict) -> pd.DataFrame:
     """Flip LV scores using sign_map (+1/-1)."""
@@ -425,6 +426,80 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     EFA1Table, EFA1Fit = one_factor_efa_table(cog, df_valid, groups, group_items)
     CFA_Loadings, CFA_Info, CFA_Fit = run_cfa(cog, df_valid, groups, group_items, item_cols)
 
+        # ==============================
+    # CB-SEM line 1: ESEM -> CFA/SEM (ordered/WLSMV)
+    # ==============================
+    CBSEM = {"info": pd.DataFrame(), "ESEM_fit": pd.DataFrame(), "ESEM_loadings": pd.DataFrame(),
+             "CFA_fit": pd.DataFrame(), "CFA_loadings": pd.DataFrame(), "SEM_fit": pd.DataFrame(), "SEM_paths": pd.DataFrame()}
+    if bool(getattr(cfg.cfa, "RUN_CBSEM_WLSMV", False)):
+        try:
+            df_cb = df_valid[item_cols].copy()
+
+            nf = int(getattr(cfg.cfa, "ESEM_NFACTORS", len(groups)))
+            rotation = str(getattr(cfg.cfa, "ESEM_ROTATION", "geomin"))
+            missing = str(getattr(cfg.cfa, "CBSEM_MISSING", "listwise"))
+
+            # SEM edges: prefer cfg.cfa.SEM_EDGES, else reuse cfg.pls.MODEL1_EDGES
+            sem_edges = list(getattr(cfg.cfa, "SEM_EDGES", []))
+            if not sem_edges:
+                sem_edges = list(getattr(cfg.pls, "MODEL1_EDGES", []))
+
+            # keep only detected groups
+            sem_edges = [(a, b) for (a, b) in sem_edges if (a in groups and b in groups)]
+            run_sem = bool(getattr(cfg.cfa, "RUN_SEM_WLSMV", True))
+
+            CBSEM = run_cbsem_esem_then_cfa_sem_wlsmv(
+                cog,
+                df_cb,
+                items=item_cols,
+                groups=groups,
+                group_items=group_items,
+                esem_nfactors=nf,
+                rotation=rotation,
+                missing=missing,
+                run_sem=run_sem,
+                sem_edges=sem_edges,
+                rscript=str(getattr(cfg.cfa, "RSCRIPT_BIN", "Rscript")),
+            )
+        except Exception as e:
+            CBSEM = {
+                "info": pd.DataFrame([{"Error": f"CBSEM_WLSMV failed: {e}"}]),
+                "ESEM_fit": pd.DataFrame(),
+                "ESEM_loadings": pd.DataFrame(),
+                "CFA_fit": pd.DataFrame(),
+                "CFA_loadings": pd.DataFrame(),
+                "SEM_fit": pd.DataFrame(),
+                "SEM_paths": pd.DataFrame(),
+            }
+
+    # ==============================
+    # CB-SEM line 2: measureQ best-practice (MLR/FIML/boot as measureQ implements)
+    # ==============================
+    MQ = {"info": pd.DataFrame(), "measureQ_log": pd.DataFrame()}
+    if bool(getattr(cfg.cfa, "RUN_MEASUREQ", False)):
+        try:
+            # measurement model (same simple-structure CFA model as default)
+            # measureQ expects a measurement model syntax string
+            model_lines = []
+            for g in groups:
+                its = group_items.get(g, [])
+                if its:
+                    model_lines.append(f"{g} =~ " + " + ".join(its))
+            model_syntax = "\n".join(model_lines)
+
+            MQ = run_measureq(
+                cog,
+                df_valid[item_cols].copy(),
+                model_syntax=model_syntax,
+                items=item_cols,
+                b_no=int(getattr(cfg.cfa, "MEASUREQ_B_NO", 1000)),
+                htmt=bool(getattr(cfg.cfa, "MEASUREQ_HTMT", True)),
+                cluster=getattr(cfg.cfa, "MEASUREQ_CLUSTER", None),
+                rscript=str(getattr(cfg.cfa, "RSCRIPT_BIN", "Rscript")),
+            )
+        except Exception as e:
+            MQ = {"info": pd.DataFrame([{"Error": f"measureQ failed: {e}"}]), "measureQ_log": pd.DataFrame()}
+
     # ==============================
     # PLS main (estimation + bootstrap) with config controls
     # ==============================
@@ -733,10 +808,39 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
         ws.freeze_panes = "A2"
 
+                # ==============================
+        # Extra sheets: CBSEM_WLSMV (ESEM->CFA/SEM) and MEASUREQ
+        # ==============================
+        if bool(getattr(cfg.cfa, "RUN_CBSEM_WLSMV", False)):
+            cb_sheet = str(getattr(cfg.io, "CBSEM_SHEET", "CBSEM_WLSMV"))
+            ws_cb = get_or_create_ws(writer, cb_sheet)
+            rc = 0
+            rc = write_block(writer, cb_sheet, ws_cb, rc, f"CBSEM-WLSMV INFO [{tag}]", CBSEM.get("info", pd.DataFrame()), index=False)
+            rc = write_block(writer, cb_sheet, ws_cb, rc, f"A. ESEM fit (scaled) [{tag}]", CBSEM.get("ESEM_fit", pd.DataFrame()), index=False)
+            rc = write_block(writer, cb_sheet, ws_cb, rc, f"B. ESEM standardized loadings [{tag}]", CBSEM.get("ESEM_loadings", pd.DataFrame()), index=False)
+            rc = write_block(writer, cb_sheet, ws_cb, rc, f"C. CFA fit (scaled) [{tag}]", CBSEM.get("CFA_fit", pd.DataFrame()), index=False)
+            rc = write_block(writer, cb_sheet, ws_cb, rc, f"D. CFA standardized loadings [{tag}]", CBSEM.get("CFA_loadings", pd.DataFrame()), index=False)
+            rc = write_block(writer, cb_sheet, ws_cb, rc, f"E. SEM fit (scaled) [{tag}]", CBSEM.get("SEM_fit", pd.DataFrame()), index=False)
+            rc = write_block(writer, cb_sheet, ws_cb, rc, f"F. SEM standardized paths [{tag}]", CBSEM.get("SEM_paths", pd.DataFrame()), index=False)
+            ws_cb.freeze_panes = "A2"
+
+        if bool(getattr(cfg.cfa, "RUN_MEASUREQ", False)):
+            mq_sheet = str(getattr(cfg.io, "MEASUREQ_SHEET", "MEASUREQ"))
+            ws_mq = get_or_create_ws(writer, mq_sheet)
+            rm = 0
+            rm = write_block(writer, mq_sheet, ws_mq, rm, f"measureQ INFO [{tag}]", MQ.get("info", pd.DataFrame()), index=False)
+
+            # Write any exported tables (measureQ_*), plus console log
+            # (tables are dynamic depending on measureQ version/settings)
+            keys = [k for k in MQ.keys() if k not in ("info",)]
+            for k in keys:
+                rm = write_block(writer, mq_sheet, ws_mq, rm, f"{k} [{tag}]", MQ.get(k, pd.DataFrame()), index=False)
+
+            ws_mq.freeze_panes = "A2"
+
         if cfg.pls.RUN_PLS:
             ws_pls = get_or_create_ws(writer, cfg.io.PLS_SHEET)
             rp = 0
-
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "MODEL 1", PLS1_info, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-A. Outer model (model API)", PLS1_outer, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-B. CR / AVE", PLS1_quality, index=False)
