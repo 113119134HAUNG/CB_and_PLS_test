@@ -212,6 +212,7 @@ class PLSConfig:
 class MGAConfig:
     RUN_MGA: bool = False
     MGA_BOOT: int = 200
+    MICOM_NUMERIC_RATIO_TH: float = 0.80
     MGA_MIN_N_PER_GROUP: int = 30
     MGA_SPLITS: List[str] = field(default_factory=lambda: ["CCO", "BS"])
 
