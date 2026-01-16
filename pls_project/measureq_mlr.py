@@ -49,7 +49,7 @@ def run_measureq(
         r_code = f"""
         suppressPackageStartupMessages(library(measureQ))
 
-        Data <- read.csv("{data_csv.as_posix()}", check.names=FALSE)
+        Data <- read.csv("{data_csv.as_posix()}", check.names=FALSE, fileEncoding="UTF-8-BOM")
         items <- c({",".join([f'"{x}"' for x in items])})
 
         # (optional) ensure item columns exist
