@@ -688,6 +688,10 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
     PLS1_BOOTPATH = PLS2_BOOTPATH = pd.DataFrame()
 
+    # ✅ NEW: paths_long export tables
+    PLS1_PATHS = pd.DataFrame()
+    PLS2_PATHS = pd.DataFrame()
+
     if cfg.pls.RUN_PLS:
         scheme_up = str(getattr(cfg.pls, "PLS_SCHEME", "PATH")).strip().upper()
         if getattr(cfg.pls, "CLEAN_MODE", True):
@@ -773,13 +777,15 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 PLS1_outer = res1["PLS_outer"]
                 PLS1_quality = res1["PLS_quality"]
                 scores1 = res1["scores"]
+                PLS1_PATHS = res1.get("paths_long", pd.DataFrame()).copy()
 
+                # ✅ htmt_matrix no longer rounds internally; round at output layer
                 PLS1_htmt = htmt_matrix(
                     Xpls[item_cols],
                     {g: lv_blocks1[g] for g in order1},
                     order1,
                     method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
-                )
+                ).round(DEC)
 
                 PLS1_R2, PLS1_f2 = r2_f2_from_scores(scores1[order1], path1)
                 PLS1_Q2 = q2_cv_from_scores(scores1[order1], path1, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
@@ -816,6 +822,9 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         standardized=True,
                     )
 
+                    # numeric 判斷：有效數值比例門檻（避免類別欄全變 NaN 還被當 numeric）
+                    num_ratio_th = float(getattr(cfg.mga, "MICOM_NUMERIC_RATIO_TH", 0.80))
+
                     for sv in split_vars:
                         sv = str(sv)
 
@@ -830,13 +839,17 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                             MICOM_out[sv] = {"info": pd.DataFrame([{"Error": f"Split var not found: {sv}"}])}
                             continue
 
-                        # numeric -> median split
-                        if pd.api.types.is_numeric_dtype(pd.to_numeric(v, errors="coerce")):
-                            vv = pd.to_numeric(v, errors="coerce")
+                        vv = pd.to_numeric(v, errors="coerce")
+                        num_ratio = float(vv.notna().mean())
+
+                        if num_ratio >= num_ratio_th:
                             thr = float(np.nanmedian(vv))
+                            if not np.isfinite(thr):
+                                MICOM_out[sv] = {"info": pd.DataFrame([{"Error": f"Numeric split failed (median is NaN): {sv}"}])}
+                                continue
                             gmask = (vv >= thr).fillna(False).to_numpy()
                             X_use = Xpls
-                            note = f"{src}; median split @ {thr:.4f}"
+                            note = f"{src}; numeric_ratio={num_ratio:.2f}; median split @ {thr:.4f}"
                         else:
                             # categorical -> top2 levels only
                             s = v.astype(str).fillna("NA")
@@ -849,7 +862,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                             X_use = Xpls.loc[keep].reset_index(drop=True)
                             s2 = s.loc[keep].reset_index(drop=True)
                             gmask = (s2 == top2[0]).to_numpy()
-                            note = f"{src}; top2 levels {top2}"
+                            note = f"{src}; numeric_ratio={num_ratio:.2f}; top2 levels {top2}"
 
                         try:
                             out = micom_two_group(
@@ -990,6 +1003,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         PLS2_outer = res2["PLS_outer"]
                         PLS2_quality = res2["PLS_quality"]
                         scores2 = res2["scores"]
+                        PLS2_PATHS = res2.get("paths_long", pd.DataFrame()).copy()
 
                         refl2 = [lv for lv in order2 if lv != commitment]
                         if refl2:
@@ -998,7 +1012,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                                 {g: group_items[g] for g in refl2},
                                 refl2,
                                 method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
-                            )
+                            ).round(DEC)
 
                         PLS2_R2, PLS2_f2 = r2_f2_from_scores(scores2[order2], path2)
                         PLS2_Q2 = q2_cv_from_scores(scores2[order2], path2, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
@@ -1180,6 +1194,10 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-B. CR / AVE", PLS1_quality, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-C. HTMT", PLS1_htmt, index=True)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-D. Cross-loadings (LV scores corr)", PLS1_cross, index=True)
+
+            # ✅ NEW: raw path coefficients table
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Paths. Path coefficients (model API)", PLS1_PATHS, index=False)
+
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-X. R²", PLS1_R2, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Y. f² (per path)", PLS1_f2, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Z. Q²(CV)", PLS1_Q2, index=False)
@@ -1200,6 +1218,10 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-C. CR / AVE", PLS2_quality, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-D. HTMT", PLS2_htmt, index=True)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-E. Cross-loadings (LV scores corr)", PLS2_cross, index=True)
+
+            # ✅ NEW: raw path coefficients table
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Paths. Path coefficients (model API)", PLS2_PATHS, index=False)
+
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-X. R²", PLS2_R2, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Y. f² (per path)", PLS2_f2, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Z. Q²(CV)", PLS2_Q2, index=False)
