@@ -40,11 +40,10 @@ class IOConfig:
     # sheets
     PAPER_SHEET: str = "Paper_OnePage"
     PLS_SHEET: str = "PLS_SmartPLS"
-
+    MICOM_SHEET: str = "MICOM"
     CBSEM_SHEET: str = "CBSEM_WLSMV"
     MEASUREQ_SHEET: str = "MEASUREQ"
     CMV_CLF_SHEET: str = "CMV_CLF_MLR"
-
     EXPORT_EXCLUDED_SHEET: bool = True
     DROP_EMAIL_IN_VALID_DF: bool = True
 
@@ -216,6 +215,11 @@ class MGAConfig:
     MGA_MIN_N_PER_GROUP: int = 30
     MGA_SPLITS: List[str] = field(default_factory=lambda: ["CCO", "BS"])
 
+    # NEW: MICOM
+    RUN_MICOM: bool = True
+    MICOM_BOOT: int = 200
+    MICOM_ALPHA: float = 0.05
+    MICOM_SPLITS: List[str] = field(default_factory=lambda: ["CCO", "BS"])
 
 # ==============================
 # Scenario config
@@ -224,7 +228,6 @@ class MGAConfig:
 class ScenarioConfig:
     SCENARIO_TARGET: str = "PA"
     RUN_REVERSE_SCENARIO: bool = False
-
 
 # ==============================
 # Main Config container
