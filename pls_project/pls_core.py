@@ -241,7 +241,8 @@ def htmt_matrix(
             denom = np.sqrt(mA * mB) if (pd.notna(mA) and pd.notna(mB) and mA > 0 and mB > 0) else np.nan
             out.loc[ga, gb] = float(mAB / denom) if pd.notna(denom) else np.nan
 
-    return out.round(3)
+    # ✅ NOTE: do NOT round here; let caller decide output precision
+    return out
 
 
 # =========================================================
@@ -352,6 +353,7 @@ def get_path_results(
     if scores_df is None:
         return pd.DataFrame()
     return path_estimates_from_scores(scores_df, path_df)
+
 
 def get_outer_results(
     model,
