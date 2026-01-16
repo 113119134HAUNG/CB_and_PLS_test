@@ -436,29 +436,56 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     SCALES = list(scale_prefixes) if scale_prefixes else list(cfg.scales.SCALES)
 
     # ==============================
-    # Find item columns (after rename)
+    # Find item columns (dynamic, do NOT depend on fixed SCALES)
     # ==============================
-    scale_alt = "|".join(map(re.escape, SCALES))
-    item_pat = re.compile(rf"^(?:{scale_alt})\d{{1,2}}$")
-    item_cols = [c for c in df.columns if item_pat.fullmatch(str(c))]
+    token_pat = re.compile(r"^([A-Z]{1,12})(\d{1,2})$")  # e.g., PA1 / MIND5 / LO12 / SRL3 / A11
+
+    prefix_first_seen: list[str] = []
+    prefix_seen: set[str] = set()
+    item_cols: list[str] = []
+
+    for col in df.columns:
+        s = str(col).strip()
+        m = token_pat.fullmatch(s)
+        if not m:
+            continue
+        pref = m.group(1).upper()
+        if pref not in prefix_seen:
+            prefix_seen.add(pref)
+            prefix_first_seen.append(pref)
+        item_cols.append(s)
 
     if not item_cols:
         raise ValueError(
-            f"找不到題項欄位！profile={profile_name}, prefixes={SCALES}. "
-            f"請確認欄名是否已被 schema rename 成 token（如 PA1 / SRL3 / A11）。"
+            f"找不到題項欄位！請確認欄名格式像 PA1 / MIND5 / LO12 這種。profile={profile_name}"
         )
 
+    # prefix order: prefer detected profile order, then fall back to first-seen order
+    ordered_prefixes: list[str] = []
+    if scale_prefixes:
+        for p in scale_prefixes:
+            pu = str(p).upper()
+            if pu in prefix_seen and pu not in ordered_prefixes:
+                ordered_prefixes.append(pu)
+
+    for p in prefix_first_seen:
+        if p not in ordered_prefixes:
+            ordered_prefixes.append(p)
+
     def sort_key(c: str):
-        m = re.match(r"^([A-Z]+)(\d+)$", str(c))
-        if not m:
-            return (999, 999)
-        prefix, num = m.group(1), int(m.group(2))
-        return (SCALES.index(prefix) if prefix in SCALES else 999, num)
+        m = token_pat.fullmatch(str(c))
+        pref, num = m.group(1).upper(), int(m.group(2))
+        return (ordered_prefixes.index(pref), num)
 
     item_cols = sorted(item_cols, key=sort_key)
 
-    groups = [g for g in SCALES if any(col.startswith(g) for col in item_cols)]
-    group_items = {g: [c for c in item_cols if c.startswith(g)] for g in groups}
+    # groups/items from detected prefixes
+    group_items = {g: [c for c in item_cols if str(c).startswith(g)] for g in ordered_prefixes}
+    groups = [g for g in ordered_prefixes if group_items.get(g)]
+
+    # keep compatibility if later code still references SCALES
+    SCALES = groups.copy()
+
     print("Profile:", profile_name)
     print("Groups:", groups)
 
