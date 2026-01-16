@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import sys
 import subprocess
-import warnings
 from typing import Dict, List, Tuple, Optional, Iterable, Any
 
 import numpy as np
@@ -113,15 +112,12 @@ def run_plspm_python(
     Clean PLS runner:
       - scheme from cfg.pls.PLS_SCHEME (PATH/FACTORIAL only)
       - iterations/tolerance from cfg.pls.PLSPM_MAX_ITER / cfg.pls.PLSPM_TOL
-      - no retries with alternative hyperparams
-      - no PCA approximation branch
       - optional auto-install controlled by cfg.pls.AUTO_INSTALL_PLSPM (if present), else False
     """
     cfg = cog.cfg.pls
 
     scheme = _scheme_to_plspm_scheme_strict(getattr(cfg, "PLS_SCHEME", "PATH"))
 
-    # Read required numeric settings from config (no hidden defaults)
     if not hasattr(cfg, "PLSPM_MAX_ITER") or not hasattr(cfg, "PLSPM_TOL"):
         raise AttributeError("Config.pls must define PLSPM_MAX_ITER and PLSPM_TOL (clean mode).")
     iters = int(cfg.PLSPM_MAX_ITER)
@@ -216,6 +212,9 @@ def htmt_matrix(
     groups_list: List[str],
     method: str = "pearson",
 ) -> pd.DataFrame:
+    """
+    NOTE: 不要在這裡 round；caller 決定輸出精度（推論用的 bootstrap 需要高精度）。
+    """
     R = X_items.corr(method=method).abs()
     out = pd.DataFrame(index=groups_list, columns=groups_list, dtype=float)
 
@@ -241,7 +240,6 @@ def htmt_matrix(
             denom = np.sqrt(mA * mB) if (pd.notna(mA) and pd.notna(mB) and mA > 0 and mB > 0) else np.nan
             out.loc[ga, gb] = float(mAB / denom) if pd.notna(denom) else np.nan
 
-    # ✅ NOTE: do NOT round here; let caller decide output precision
     return out
 
 
@@ -374,7 +372,6 @@ def get_outer_results(
       4) strict=True -> raise with debug info
          strict=False -> corr fallback
     """
-
     expected_lvs = list(scores_df.columns) if scores_df is not None else list(lv_blocks.keys())
     expected_lvs = [lv for lv in expected_lvs if lv in lv_blocks or lv in expected_lvs]
     expected_inds = []
@@ -391,7 +388,6 @@ def get_outer_results(
         if isinstance(obj, pd.DataFrame):
             return obj
 
-        # if it's list/tuple of dicts/objects
         if isinstance(obj, (list, tuple)) and len(obj) > 0:
             first = obj[0]
             if isinstance(first, dict):
@@ -399,7 +395,6 @@ def get_outer_results(
                     return pd.DataFrame(obj)
                 except Exception:
                     return None
-            # namedtuple / dataclass / row object
             if hasattr(first, "_asdict"):
                 try:
                     return pd.DataFrame([x._asdict() for x in obj])
@@ -411,7 +406,6 @@ def get_outer_results(
                 except Exception:
                     return None
 
-        # common wrappers
         for attr in ["df", "dataframe", "table", "data", "frame", "values"]:
             if hasattr(obj, attr):
                 v = getattr(obj, attr)
@@ -423,7 +417,6 @@ def get_outer_results(
                 except Exception:
                     pass
 
-        # conversion methods
         for meth in ["to_dataframe", "to_df", "as_dataframe", "to_pandas", "to_dict"]:
             if hasattr(obj, meth) and callable(getattr(obj, meth)):
                 try:
@@ -445,24 +438,20 @@ def get_outer_results(
     def _looks_like_matrix(DF: pd.DataFrame) -> bool:
         if DF is None or DF.empty:
             return False
-        # indicator x construct
         ind_hit = len(set(expected_inds) & set(map(str, DF.index)))
         lv_hit = len(set(expected_lvs) & set(map(str, DF.columns)))
         if ind_hit > 0 and lv_hit > 0:
             return True
-        # maybe transposed
         ind_hit2 = len(set(expected_inds) & set(map(str, DF.columns)))
         lv_hit2 = len(set(expected_lvs) & set(map(str, DF.index)))
         return (ind_hit2 > 0 and lv_hit2 > 0)
 
     def _matrix_to_outer(M: pd.DataFrame) -> pd.DataFrame:
-        # normalize orientation
         if set(expected_inds).issubset(set(map(str, M.index))) and set(expected_lvs).issubset(set(map(str, M.columns))):
             Mat = M.copy()
         elif set(expected_lvs).issubset(set(map(str, M.index))) and set(expected_inds).issubset(set(map(str, M.columns))):
             Mat = M.T.copy()
         else:
-            # shape-based fallback
             A = M.to_numpy()
             if A.shape == (len(expected_inds), len(expected_lvs)):
                 Mat = pd.DataFrame(A, index=expected_inds, columns=expected_lvs)
@@ -499,7 +488,6 @@ def get_outer_results(
         c_weight = cols.get("weight") or cols.get("outer_weight") or cols.get("outer_weights")
 
         if (c_construct is None) or (c_ind is None):
-            # attempt overlap-based inference
             best_lv = (None, -1)
             best_it = (None, -1)
             for c in DF.columns:
@@ -526,9 +514,8 @@ def get_outer_results(
         out["Mode"] = out["Construct"].map(lambda lv: str(lv_modes.get(lv, "A")).upper())
         out["Mode"] = out["Mode"].map(lambda m: "A(reflective)" if m == "A" else "B(formative)")
         out["Communality(h2)"] = pd.to_numeric(out["OuterLoading"], errors="coerce") ** 2
-        return out[["Construct","Indicator","Mode","OuterLoading","OuterWeight","Communality(h2)"]]
+        return out[["Construct", "Indicator", "Mode", "OuterLoading", "OuterWeight", "Communality(h2)"]]
 
-    # candidates to try
     cand_names = ["outer_model", "crossloadings", "outer", "outer_summary", "measurement_model"]
 
     for nm in cand_names:
@@ -536,22 +523,18 @@ def get_outer_results(
             continue
         raw = getattr(model, nm)
 
-        # unwrap
         DF = _to_df(raw)
 
-        # 1) long-table try
         out = _try_long_table(DF)
         if out is not None and not out.empty:
             return out
 
-        # 2) matrix try
         if DF is not None and _looks_like_matrix(DF):
             try:
                 return _matrix_to_outer(DF)
             except Exception:
                 pass
 
-        # 3) object might contain .loadings / .weights
         obj = _maybe_call(raw)
         for sub in ["loadings", "weights", "outer_loadings", "outer_weights"]:
             if hasattr(obj, sub):
@@ -559,7 +542,6 @@ def get_outer_results(
                 if sub_df is not None and _looks_like_matrix(sub_df):
                     try:
                         tmp = _matrix_to_outer(sub_df)
-                        # treat weights if available
                         if sub.lower().endswith("weights"):
                             tmp["OuterWeight"] = tmp["OuterLoading"]
                             tmp["OuterLoading"] = np.nan
@@ -569,14 +551,12 @@ def get_outer_results(
                         pass
 
     if strict:
-        # show what we tried for faster debugging
-        available = [a for a in dir(model) if any(k in a.lower() for k in ["outer","loading","weight","cross"])]
+        available = [a for a in dir(model) if any(k in a.lower() for k in ["outer", "loading", "weight", "cross"])]
         raise AttributeError(
             "Cannot extract outer model from plspm model API. "
             f"Tried {cand_names}. Available outer-related attrs={available}"
         )
 
-    # last resort: correlation fallback
     cross = corr_items_vs_scores(X, scores_df, method="pearson")
     rows = []
     for lv, inds in lv_blocks.items():
@@ -594,6 +574,7 @@ def get_outer_results(
                 "Communality(h2)": (ol ** 2) if mode == "A" else np.nan,
             })
     return pd.DataFrame(rows)
+
 
 # =========================================================
 # 4) Structural helpers (diagnostics)
