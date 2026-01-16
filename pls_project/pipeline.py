@@ -33,6 +33,7 @@ from pls_project.pls_core import (
     get_path_results,
     apply_sign_to_paths,
     get_sign_map_by_anchors,
+    apply_sign_to_scores,
     apply_sign_to_scores, 
 )
 
