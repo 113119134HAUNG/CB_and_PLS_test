@@ -37,14 +37,13 @@ class IOConfig:
     OUT_XLSX_BASE: str = "/content/drive/MyDrive/前測_論文表格輸出"
     OUT_CSV_BASE: str = "/content/drive/MyDrive/BACK_scored"
 
-    # existing sheets
+    # sheets
     PAPER_SHEET: str = "Paper_OnePage"
     PLS_SHEET: str = "PLS_SmartPLS"
-    CMV_CLF_SHEET: str = "CMV_CLF_MLR"
-    
-    # NEW: extra sheets for two CB-SEM lines
+
     CBSEM_SHEET: str = "CBSEM_WLSMV"
     MEASUREQ_SHEET: str = "MEASUREQ"
+    CMV_CLF_SHEET: str = "CMV_CLF_MLR"
 
     EXPORT_EXCLUDED_SHEET: bool = True
     DROP_EMAIL_IN_VALID_DF: bool = True
@@ -64,7 +63,6 @@ class ScaleConfig:
 # ==============================
 @dataclass
 class FilterConfig:
-    # ---- NEW: 三個前處理開關 ----
     FILTER_NOEXP: bool = True
     FILTER_DUPLICATE: bool = False
     FILTER_CARELESS: bool = False
@@ -94,36 +92,33 @@ class FilterConfig:
 # ==============================
 @dataclass
 class CFAConfig:
-    # ---- existing CFA switch (your current run_cfa in paper.py) ----
+    # ---- existing CFA (paper.py run_cfa) ----
     RUN_CFA: bool = True
     CFA_MISSING: str = "listwise"
     CFA_OBJ: str = "MLW"
     CFA_ROBUST_SE: bool = False
 
-    # ---- NEW: paper decimals for CB-SEM/measureQ exports ----
+    # decimals for CB-SEM/measureQ exports
     PAPER_DECIMALS: int = 3
 
-    # ---- NEW: line 1 (lavaan) ESEM -> CFA/SEM with ordered/WLSMV ----
-    RUN_CBSEM_WLSMV: bool = False          # master switch
-    RUN_SEM_WLSMV: bool = True             # run SEM paths after CFA (if edges exist)
-    RSCRIPT_BIN: str = "Rscript"           # path or command name of Rscript
+    # ---- R runtime ----
+    RSCRIPT_BIN: str = "Rscript"  # path or command name
 
-    # ESEM settings
-    ESEM_NFACTORS: int = 0                 # 0 = auto use len(groups) in pipeline
+    # ---- line 1: lavaan ESEM -> CFA/SEM with ordered/WLSMV ----
+    RUN_CBSEM_WLSMV: bool = False
+    RUN_SEM_WLSMV: bool = True
+    ESEM_NFACTORS: int = 0                 # 0 => auto use len(groups) in pipeline
     ESEM_ROTATION: str = "geomin"          # geomin / oblimin / etc.
     CBSEM_MISSING: str = "listwise"        # listwise / pairwise (lavaan option)
-
-    # SEM edges for CB-SEM line (optional).
-    # If empty, pipeline can fall back to cfg.pls.MODEL1_EDGES
     SEM_EDGES: List[Tuple[str, str]] = field(default_factory=list)
 
-    # ---- NEW: line 2 measureQ best-practice ----
-    RUN_MEASUREQ: bool = False             # master switch
-    MEASUREQ_B_NO: int = 1000              # bootstrap repetitions in measureQ
-    MEASUREQ_HTMT: bool = True             # ask measureQ to output HTMT-related table(s)
-    MEASUREQ_CLUSTER: Optional[str] = None # cluster variable name (optional)
+    # ---- line 2: measureQ best-practice ----
+    RUN_MEASUREQ: bool = False
+    MEASUREQ_B_NO: int = 1000
+    MEASUREQ_HTMT: bool = True
+    MEASUREQ_CLUSTER: Optional[str] = None
 
-     # ---- NEW: line 3 measureQ best-practice ----
+    # ---- line 3: CMV robustness via CLF/ULMC-like model (MLR line) ----
     RUN_CMV_CLF_MLR: bool = False
     CLF_ESTIMATOR: str = "MLR"
     CLF_MISSING: str = "ML"
@@ -131,6 +126,7 @@ class CFAConfig:
     CLF_ORTHOGONAL: bool = True
     CLF_EQUAL_LOADINGS: bool = True
     CLF_DELTA_LOADING_FLAG: float = 0.10
+
 
 # ==============================
 # PLS config
@@ -150,7 +146,7 @@ class PLSConfig:
     PLS_STANDARDIZED: bool = True
     PLSPM_MAX_ITER: int = 3000
     PLSPM_TOL: float = 1e-7
-    PLS_MISSING: str = "listwise"   # "none" | "listwise" | "mean"
+    PLS_MISSING: str = "listwise"     # "none" | "listwise" | "mean"
 
     # ---- Correlation methods ----
     HTMT_CORR_METHOD: str = "pearson"
@@ -172,12 +168,20 @@ class PLSConfig:
     BOOT_ALPHA: float = 0.05
     BOOT_TEST_TYPE: str = "two-tailed"
 
-    # ---- Model1 / Model2 control ----
+    # ---- Model control ----
     RUN_MODEL1: bool = True
     RUN_MODEL2: bool = True
+
+    # ---- CMV diagnostic (Full collinearity VIF) ----
     RUN_FULL_COLLINEARITY_VIF: bool = True
     FULL_VIF_THRESHOLD: float = 3.3
-    
+
+    # ---- G*Power-equivalent (multiple regression) ----
+    RUN_GPOWER: bool = False
+    GPOWER_F2: float = 0.02
+    GPOWER_ALPHA: float = 0.05
+    GPOWER_POWER: float = 0.80
+
     MODEL1_EDGES: List[Tuple[str, str]] = field(default_factory=lambda: [
         ("SA", "MIND"), ("SA", "ACO"), ("SA", "CCO"),
         ("PA", "BB"), ("PA", "BS"),
