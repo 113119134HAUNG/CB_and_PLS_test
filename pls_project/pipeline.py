@@ -29,14 +29,13 @@ from pls_project.pls_core import (
     q2_cv_from_scores,
     structural_vif,
     ols_fit,
+    # bootstrap needs these:
     run_plspm_python,
     get_path_results,
     apply_sign_to_paths,
     get_sign_map_by_anchors,
     apply_sign_to_scores,
-    apply_sign_to_scores, 
 )
-
 
 from pls_project.pls_estimate import estimate_pls_basic_paper
 from pls_project.pls_bootstrap import summarize_direct_ci
@@ -401,21 +400,38 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 "This usually means multiple original columns mapped to the same token."
             )
 
-    TS_COL = resolved_cols.get("TS_COL", cfg.cols.TS_COL)
-    USER_COL = resolved_cols.get("USER_COL", cfg.cols.USER_COL)
-    EMAIL_COL = resolved_cols.get("EMAIL_COL", cfg.cols.EMAIL_COL)
-    EXP_COL = resolved_cols.get("EXP_COL", cfg.cols.EXP_COL)
+    def _pick_col(key: str, cfg_default: str | None) -> str | None:
+        """
+        Prefer schema-resolved column. If missing, use cfg_default ONLY IF it exists in df.
+        If still missing, return None (feature will be skipped).
+        """
+        c = resolved_cols.get(key)
+        if c is not None and c in df.columns:
+            return c
+        if isinstance(cfg_default, str) and cfg_default in df.columns:
+            return cfg_default
+        return None
 
+    TS_COL = _pick_col("TS_COL", getattr(cfg.cols, "TS_COL", None))
+    USER_COL = _pick_col("USER_COL", getattr(cfg.cols, "USER_COL", None))
+    EMAIL_COL = _pick_col("EMAIL_COL", getattr(cfg.cols, "EMAIL_COL", None))
+    EXP_COL = _pick_col("EXP_COL", getattr(cfg.cols, "EXP_COL", None))
+
+    # Special-case: 如果 EXP_COL 指到「頻率」但同時存在「經驗」，優先用經驗
     EXP_COL_EXPER = "使用AI工具來學習之經驗"
-    EXP_COL_FREQ = "使用AI工具來學習之頻率"
-    if EXP_COL in df.columns and ("頻率" in str(EXP_COL)) and (EXP_COL_EXPER in df.columns):
+    if EXP_COL is not None and ("頻率" in str(EXP_COL)) and (EXP_COL_EXPER in df.columns):
         EXP_COL = EXP_COL_EXPER
 
+    # (通常不會發生) 若 rename_map 真的包含 meta 欄名，這裡也容錯
     if rename_map:
-        TS_COL = rename_map.get(TS_COL, TS_COL)
-        USER_COL = rename_map.get(USER_COL, USER_COL)
-        EMAIL_COL = rename_map.get(EMAIL_COL, EMAIL_COL)
-        EXP_COL = rename_map.get(EXP_COL, EXP_COL)
+        if TS_COL is not None:
+            TS_COL = rename_map.get(TS_COL, TS_COL)
+        if USER_COL is not None:
+            USER_COL = rename_map.get(USER_COL, USER_COL)
+        if EMAIL_COL is not None:
+            EMAIL_COL = rename_map.get(EMAIL_COL, EMAIL_COL)
+        if EXP_COL is not None:
+            EXP_COL = rename_map.get(EXP_COL, EXP_COL)
 
     SCALES = list(scale_prefixes) if scale_prefixes else list(cfg.scales.SCALES)
 
@@ -472,27 +488,34 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             return float(x) > 0
 
         s = str(x).strip()
-        no_kw = ["沒有", "否", "不曾", "從未", "未", "無"]
-        if any(k in s for k in no_kw):
+        no_kw = ["沒有", "否", "不曾", "從未", "未", "無", "no", "false"]
+        if any(k.lower() in s.lower() for k in no_kw):
             return False
         if re.search(r"\d", s) and any(u in s for u in ["小時", "天", "週", "月", "年"]):
             return True
-        yes_kw = ["有", "是", "曾", "使用過"]
-        if any(k in s for k in yes_kw):
+        yes_kw = ["有", "是", "曾", "使用過", "yes", "true"]
+        if any(k.lower() in s.lower() for k in yes_kw):
             return True
         return False
 
-    if FILTER_NOEXP and (EXP_COL in df.columns):
-        df["_flag_noexp"] = ~df[EXP_COL].apply(has_experience)
+    if FILTER_NOEXP:
+        if EXP_COL is not None and (EXP_COL in df.columns):
+            df["_flag_noexp"] = ~df[EXP_COL].apply(has_experience)
+        else:
+            if hasattr(cog, "log") and cog.log:
+                cog.log.warning("FILTER_NOEXP=True but EXP_COL not resolved/found; skipping no-exp filter.")
 
     if FILTER_DUP:
-        df["_ts"] = pd.to_datetime(df[TS_COL], errors="coerce") if TS_COL in df.columns else pd.NaT
+        df["_ts"] = pd.to_datetime(df[TS_COL], errors="coerce") if (TS_COL is not None and TS_COL in df.columns) else pd.NaT
         df["_orig_order"] = np.arange(len(df))
-        dup_key = [c for c in [USER_COL, EMAIL_COL] if c in df.columns]
+        dup_key = [c for c in [USER_COL, EMAIL_COL] if (c is not None and c in df.columns)]
         if dup_key:
             df_sorted = df.sort_values(["_ts", "_orig_order"], na_position="last").copy()
             df_sorted["_flag_dup"] = df_sorted.duplicated(subset=dup_key, keep=cfg.filt.KEEP_DUP)
             df = df_sorted.sort_values("_orig_order")
+        else:
+            if hasattr(cog, "log") and cog.log:
+                cog.log.warning("FILTER_DUPLICATE=True but USER_COL/EMAIL_COL not resolved; skipping duplicate filter.")
 
     # ==============================
     # Likert -> numeric
@@ -571,7 +594,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     print("剔除樣本數:", len(excluded_df))
     print("有效樣本數:", len(df_valid))
 
-    if cfg.io.DROP_EMAIL_IN_VALID_DF and (EMAIL_COL in df_valid.columns):
+    if cfg.io.DROP_EMAIL_IN_VALID_DF and (EMAIL_COL is not None) and (EMAIL_COL in df_valid.columns):
         df_valid = df_valid.drop(columns=[EMAIL_COL])
 
     df_valid = df_valid.drop(columns=[c for c in df_valid.columns if c.startswith("_")], errors="ignore")
