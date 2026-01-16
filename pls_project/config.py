@@ -44,6 +44,7 @@ class IOConfig:
     CBSEM_SHEET: str = "CBSEM_WLSMV"
     MEASUREQ_SHEET: str = "MEASUREQ"
     CMV_CLF_SHEET: str = "CMV_CLF_MLR"
+
     EXPORT_EXCLUDED_SHEET: bool = True
     DROP_EMAIL_IN_VALID_DF: bool = True
 
@@ -79,7 +80,7 @@ class FilterConfig:
     CARELESS_USE_SD: bool = True
     CARELESS_USE_LONGSTRING: bool = True
 
-    # (optional) jump filter (kept for compatibility)
+    # jump filter (NOW implemented in pipeline.py)
     USE_JUMP_FILTER: bool = False
     JUMP_DIFF: int = 3
     JUMP_RATE_TH: float = 0.80
@@ -106,9 +107,9 @@ class CFAConfig:
     # ---- line 1: lavaan ESEM -> CFA/SEM with ordered/WLSMV ----
     RUN_CBSEM_WLSMV: bool = False
     RUN_SEM_WLSMV: bool = True
-    ESEM_NFACTORS: int = 0                 # 0 => auto use len(groups) in pipeline
-    ESEM_ROTATION: str = "geomin"          # geomin / oblimin / etc.
-    CBSEM_MISSING: str = "listwise"        # listwise / pairwise (lavaan option)
+    ESEM_NFACTORS: int = 0
+    ESEM_ROTATION: str = "geomin"
+    CBSEM_MISSING: str = "listwise"
     SEM_EDGES: List[Tuple[str, str]] = field(default_factory=list)
 
     # ---- line 2: measureQ best-practice ----
@@ -181,6 +182,16 @@ class PLSConfig:
     GPOWER_ALPHA: float = 0.05
     GPOWER_POWER: float = 0.80
 
+    # ---- NEW: inference switches (used by pipeline.py) ----
+    RUN_EFFECTS_INFERENCE: bool = True
+    RUN_HTMT_INFERENCE: bool = True
+    RUN_PLS_PREDICT: bool = True
+
+    HTMT_BOOT: int = 200
+    HTMT_THRESHOLD: float = 0.90
+
+    PREDICT_FOLDS: int = 10
+
     MODEL1_EDGES: List[Tuple[str, str]] = field(default_factory=lambda: [
         ("SA", "MIND"), ("SA", "ACO"), ("SA", "CCO"),
         ("PA", "BB"), ("PA", "BS"),
@@ -212,15 +223,18 @@ class PLSConfig:
 class MGAConfig:
     RUN_MGA: bool = False
     MGA_BOOT: int = 200
-    MICOM_NUMERIC_RATIO_TH: float = 0.80
     MGA_MIN_N_PER_GROUP: int = 30
     MGA_SPLITS: List[str] = field(default_factory=lambda: ["CCO", "BS"])
 
-    # NEW: MICOM
+    # MICOM
     RUN_MICOM: bool = True
     MICOM_BOOT: int = 200
     MICOM_ALPHA: float = 0.05
     MICOM_SPLITS: List[str] = field(default_factory=lambda: ["CCO", "BS"])
+
+    # NEW: numeric detection threshold for MICOM split var
+    MICOM_NUMERIC_RATIO_TH: float = 0.80
+
 
 # ==============================
 # Scenario config
@@ -229,6 +243,7 @@ class MGAConfig:
 class ScenarioConfig:
     SCENARIO_TARGET: str = "PA"
     RUN_REVERSE_SCENARIO: bool = False
+
 
 # ==============================
 # Main Config container
