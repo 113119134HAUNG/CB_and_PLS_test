@@ -10,10 +10,16 @@ from typing import List, Dict, Union, Tuple, Optional
 # ==============================
 @dataclass
 class ColumnConfig:
-    TS_COL = resolved_cols.get("TS_COL", None)
-    USER_COL = resolved_cols.get("USER_COL", None)
-    EMAIL_COL = resolved_cols.get("EMAIL_COL", None)
-    EXP_COL = resolved_cols.get("EXP_COL", None)
+    """
+    These are meta column names in the raw Excel.
+    They will be resolved/overridden by schema.resolve_schema() at runtime.
+    Keep them as OPTIONAL defaults; do NOT reference runtime vars here.
+    """
+    TS_COL: Optional[str] = None
+    USER_COL: Optional[str] = None
+    EMAIL_COL: Optional[str] = None
+    EXP_COL: Optional[str] = None
+
 
 # ==============================
 # Runtime filled by schema
@@ -111,6 +117,15 @@ class CFAConfig:
     CBSEM_MISSING: str = "listwise"
     SEM_EDGES: List[Tuple[str, str]] = field(default_factory=list)
 
+    # ---- NEW: MG-CFA invariance (ordered/WLSMV) ----
+    RUN_CBSEM_INVARIANCE: bool = True
+    # None => auto-pick a reasonable grouping variable from df_valid (excluding items).
+    # Or explicitly set e.g. "性別" / "年級" / "使用AI工具來學習之經驗"
+    INV_GROUP_VAR: Optional[str] = None
+    INV_NUMERIC_RATIO_TH: float = 0.80
+    INV_MIN_N_PER_GROUP: int = 30
+    INV_INCLUDE_STRICT: bool = False
+
     # ---- line 2: measureQ best-practice ----
     RUN_MEASUREQ: bool = False
     MEASUREQ_B_NO: int = 1000
@@ -181,7 +196,7 @@ class PLSConfig:
     GPOWER_ALPHA: float = 0.05
     GPOWER_POWER: float = 0.80
 
-    # ---- NEW: inference switches (used by pipeline.py) ----
+    # ---- inference switches (used by pipeline.py) ----
     RUN_EFFECTS_INFERENCE: bool = True
     RUN_HTMT_INFERENCE: bool = True
     RUN_PLS_PREDICT: bool = True
@@ -231,7 +246,7 @@ class MGAConfig:
     MICOM_ALPHA: float = 0.05
     MICOM_SPLITS: List[str] = field(default_factory=lambda: ["CCO", "BS"])
 
-    # NEW: numeric detection threshold for MICOM split var
+    # numeric detection threshold for MICOM split var
     MICOM_NUMERIC_RATIO_TH: float = 0.80
 
 
