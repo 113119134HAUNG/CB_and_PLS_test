@@ -21,7 +21,7 @@ def run_measureq(
     rscript: str = "Rscript",
 ) -> Dict[str, pd.DataFrame]:
     """
-    Runs measureQ(Model, Data, b.no=..., HTMT="TRUE"/"FALSE", cluster=...)
+    Runs measureQ(Model, Data, b.no=..., HTMT=TRUE/FALSE, cluster=...)
     and exports any returned tables (if available) + a console log.
 
     Returns dict of DataFrames:
@@ -43,6 +43,7 @@ def run_measureq(
 
         df_items.to_csv(data_csv, index=False, encoding="utf-8-sig")
 
+        # IMPORTANT: pass HTMT as boolean (not a quoted string)
         cluster_arg = f', cluster="{cluster}"' if cluster else ""
         htmt_arg = "TRUE" if htmt else "FALSE"
 
@@ -61,7 +62,7 @@ def run_measureq(
 
         # capture console output
         sink(file.path("{out_dir.as_posix()}", "measureQ_console.txt"))
-        res <- measureQ(Model, Data, b.no={int(b_no)}, HTMT="{htmt_arg}"{cluster_arg})
+        res <- measureQ(Model, Data, b.no={int(b_no)}, HTMT={htmt_arg}{cluster_arg})
         print(res)
         sink()
 
