@@ -7,6 +7,9 @@ from itertools import groupby
 import numpy as np
 import pandas as pd
 
+from scipy.stats import f as fdist
+from scipy.stats import ncf
+
 from pls_project.schema import resolve_schema
 from pls_project.io_utils import to_score, reverse_1to5, get_or_create_ws, write_block
 
@@ -25,7 +28,7 @@ from pls_project.pls_core import (
     r2_f2_from_scores,
     q2_cv_from_scores,
     structural_vif,
-    ols_fit,  # NEW: for full collinearity VIF
+    ols_fit,
     # bootstrap needs these:
     run_plspm_python,
     get_path_results,
@@ -35,14 +38,14 @@ from pls_project.pls_core import (
 
 from pls_project.pls_estimate import estimate_pls_basic_paper
 from pls_project.pls_bootstrap import summarize_direct_ci
-from pls_project.cmv_clf_mlr import run_cmv_clf_mlr
 
 from pls_project.cbsem_wlsmv import run_cbsem_esem_then_cfa_sem_wlsmv
 from pls_project.measureq_mlr import run_measureq
+from pls_project.cmv_clf_mlr import run_cmv_clf_mlr
 
 
 # =========================================================
-# NEW: Full collinearity VIF (CMV diagnostic) on LV scores
+# CMV: Full collinearity VIF (Kock-style diagnostic) on LV scores
 # =========================================================
 def full_collinearity_vif(
     scores_df: pd.DataFrame,
@@ -61,18 +64,17 @@ def full_collinearity_vif(
     if scores_df is None or scores_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    cols = [c for c in scores_df.columns if c in scores_df.columns]
+    cols = list(scores_df.columns)
     rows = []
 
     for y in cols:
         Xcols = [c for c in cols if c != y]
-        if len(Xcols) == 0:
+        if not Xcols:
             continue
 
         yv = pd.to_numeric(scores_df[y], errors="coerce").to_numpy()
         Xv = scores_df[Xcols].apply(pd.to_numeric, errors="coerce").to_numpy()
 
-        # drop rows with NaN
         ok = np.isfinite(yv) & np.isfinite(Xv).all(axis=1)
         if ok.sum() < max(5, len(Xcols) + 2):
             r2 = np.nan
@@ -106,6 +108,114 @@ def full_collinearity_vif(
     return summary.round(decimals), detail.round(decimals)
 
 
+# =========================================================
+# G*Power (equivalent) - multiple regression R^2 deviation from zero
+# =========================================================
+def gpower_required_n_multiple_regression(
+    *,
+    u_predictors: int,
+    f2: float,
+    alpha: float,
+    power: float,
+    n_max: int = 20000,
+) -> int:
+    """
+    G*Power-equivalent for Linear multiple regression (R^2 deviation from zero)
+    using Cohen's f^2 and noncentral F.
+
+    u = number of predictors
+    v = N - u - 1
+    lambda = f^2 * N
+    power = P(F > F_crit | ncf(u,v,lambda))
+    """
+    u = int(u_predictors)
+    if u < 1:
+        raise ValueError("u_predictors must be >= 1")
+    if f2 <= 0:
+        raise ValueError("f2 must be > 0")
+    if not (0 < alpha < 1) or not (0 < power < 1):
+        raise ValueError("alpha and power must be in (0,1)")
+
+    def _power_at_n(N: int) -> float:
+        v = N - u - 1
+        if v <= 1:
+            return 0.0
+        lam = float(f2) * float(N)
+        fcrit = fdist.isf(alpha, u, v)
+        return float(1.0 - ncf.cdf(fcrit, u, v, lam))
+
+    N_lo = u + 3
+    if _power_at_n(N_lo) >= power:
+        return N_lo
+
+    N = N_lo
+    while N < n_max and _power_at_n(N) < power:
+        N = int(N * 1.2) + 1
+
+    if N >= n_max:
+        return n_max
+
+    hi = N
+    lo = max(N_lo, int(hi / 1.2) - 5)
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if _power_at_n(mid) >= power:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def gpower_table_for_path_model(
+    *,
+    path_df: pd.DataFrame,
+    n_actual: int,
+    f2: float,
+    alpha: float,
+    power: float,
+) -> pd.DataFrame:
+    """
+    Conservative: use max number of predictors among endogenous equations.
+    """
+    if path_df is None or path_df.empty:
+        return pd.DataFrame([{"Info": "path_df empty; G*Power not applicable."}])
+
+    rows = []
+    for to in path_df.index:
+        preds = [c for c in path_df.columns if int(path_df.loc[to, c]) == 1]
+        if preds:
+            rows.append({"Endogenous": to, "k_predictors": len(preds), "Predictors": ", ".join(preds)})
+
+    if not rows:
+        return pd.DataFrame([{"Info": "No endogenous equations detected in path_df; G*Power not applicable."}])
+
+    tmp = pd.DataFrame(rows)
+    u_max = int(tmp["k_predictors"].max())
+
+    n_req = gpower_required_n_multiple_regression(
+        u_predictors=u_max,
+        f2=float(f2),
+        alpha=float(alpha),
+        power=float(power),
+    )
+
+    summary = pd.DataFrame([{
+        "Rule": "Multiple regression (R² deviation from zero), conservative on max predictors",
+        "u_max_predictors": u_max,
+        "f2": float(f2),
+        "alpha": float(alpha),
+        "power_target": float(power),
+        "N_required": int(n_req),
+        "N_actual": int(n_actual),
+        "Pass(N_actual>=N_required)": bool(int(n_actual) >= int(n_req)),
+    }])
+
+    return pd.concat([summary, pd.DataFrame([{}]), tmp], ignore_index=True)
+
+
+# =========================================================
+# helpers
+# =========================================================
 def _apply_sign_to_scores(scores_df: pd.DataFrame, sign_map: dict) -> pd.DataFrame:
     """Flip LV scores using sign_map (+1/-1)."""
     out = scores_df.copy()
@@ -126,13 +236,6 @@ def _bootstrap_paths_single_model(
     key_df: pd.DataFrame,
     anchors: dict,
 ) -> np.ndarray:
-    """
-    Bootstrap direct paths for a single model.
-    - Resample rows with replacement
-    - Re-run plspm
-    - Extract path coefficients from model API
-    - Apply sign alignment based on the same anchors
-    """
     cfg = cog.cfg.pls
     B = int(cfg.PLS_BOOT)
     seed = int(cfg.PLS_SEED)
@@ -206,13 +309,6 @@ def _bootstrap_paths_two_stage_model2(
     anchors2: dict,
     key2: pd.DataFrame,
 ) -> np.ndarray:
-    """
-    Bootstrap Model2 (two-stage):
-      - resample original indicators
-      - stage1: re-run Model1 to obtain component LV scores (sign-aligned)
-      - create component score columns in Xb2
-      - stage2: run Model2 and extract path coefficients (sign-aligned)
-    """
     cfg = cog.cfg.pls
     B = int(cfg.PLS_BOOT)
     seed = int(cfg.PLS_SEED)
@@ -249,7 +345,7 @@ def _bootstrap_paths_two_stage_model2(
                     if lv not in s1b.columns:
                         raise RuntimeError(f"Stage1 bootstrap missing component LV score: {lv}")
                 if s1b[comp_lvs].isna().any().any():
-                    raise RuntimeError("Stage1 bootstrap component scores contain NaN (clean mode forbids fill).")
+                    raise RuntimeError("Stage1 bootstrap component scores contain NaN (clean mode forbids fillna).")
 
                 Xb2 = Xb.copy()
                 for lv, col in zip(comp_lvs, comp_cols):
@@ -293,6 +389,9 @@ def _bootstrap_paths_two_stage_model2(
     return boot2
 
 
+# =========================================================
+# main
+# =========================================================
 def run_pipeline(cog, reverse_target: bool, tag: str):
     cfg = cog.cfg
     OUT_XLSX = f"{cfg.io.OUT_XLSX_BASE}_{tag}.xlsx"
@@ -396,21 +495,17 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
         s = str(x).strip()
 
-        # 明確否定
         no_kw = ["沒有", "否", "不曾", "從未", "未", "無"]
         if any(k in s for k in no_kw):
             return False
 
-        # 只要看起來像「頻率/經驗」字串，就視為有（例如：1~2小時/天、3~4年）
         if re.search(r"\d", s) and any(u in s for u in ["小時", "天", "週", "月", "年"]):
             return True
 
-        # 明確肯定
         yes_kw = ["有", "是", "曾", "使用過"]
         if any(k in s for k in yes_kw):
             return True
 
-        # 其他看不懂 → 預設 False（保守）
         return False
 
     # 1) No experience
@@ -544,15 +639,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 rscript=str(getattr(cfg.cfa, "RSCRIPT_BIN", "Rscript")),
             )
         except Exception as e:
-            CBSEM = {
-                "info": pd.DataFrame([{"Error": f"CBSEM_WLSMV failed: {e}"}]),
-                "ESEM_fit": pd.DataFrame(),
-                "ESEM_loadings": pd.DataFrame(),
-                "CFA_fit": pd.DataFrame(),
-                "CFA_loadings": pd.DataFrame(),
-                "SEM_fit": pd.DataFrame(),
-                "SEM_paths": pd.DataFrame(),
-            }
+            CBSEM = {"info": pd.DataFrame([{"Error": f"CBSEM_WLSMV failed: {e}"}])}
 
     # ==============================
     # CB-SEM line 2: measureQ best-practice (MLR robustness)
@@ -579,13 +666,22 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             )
         except Exception as e:
             MQ = {"info": pd.DataFrame([{"Error": f"measureQ failed: {e}"}]), "measureQ_log": pd.DataFrame()}
-    
+
     # ==============================
     # CB-SEM line 3: CMV robustness via CLF/ULMC-like model (MLR)
     # ==============================
-    CMV3 = {"info": pd.DataFrame(), "BASE_fit": pd.DataFrame(), "CLF_fit": pd.DataFrame(), "DELTA_fit": pd.DataFrame(),
-            "BASE_loadings": pd.DataFrame(), "CLF_loadings_sub": pd.DataFrame(), "CLF_loadings_method": pd.DataFrame(),
-            "DELTA_loadings": pd.DataFrame(), "DELTA_summary": pd.DataFrame(), "console_log": pd.DataFrame()}
+    CMV3 = {
+        "info": pd.DataFrame(),
+        "BASE_fit": pd.DataFrame(),
+        "CLF_fit": pd.DataFrame(),
+        "DELTA_fit": pd.DataFrame(),
+        "BASE_loadings": pd.DataFrame(),
+        "CLF_loadings_sub": pd.DataFrame(),
+        "CLF_loadings_method": pd.DataFrame(),
+        "DELTA_loadings": pd.DataFrame(),
+        "DELTA_summary": pd.DataFrame(),
+        "console_log": pd.DataFrame(),
+    }
 
     if bool(getattr(cfg.cfa, "RUN_CMV_CLF_MLR", False)):
         try:
@@ -605,7 +701,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             )
         except Exception as e:
             CMV3 = {"info": pd.DataFrame([{"Error": f"CMV_CLF_MLR failed: {e}"}])}
-    
+
     # ==============================
     # PLS main (estimation + bootstrap) with config controls
     # ==============================
@@ -615,14 +711,17 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     PLS1_R2 = PLS1_f2 = PLS1_Q2 = PLS1_VIF = pd.DataFrame()
     PLS2_R2 = PLS2_f2 = PLS2_Q2 = PLS2_VIF = pd.DataFrame()
 
-    # NEW: full collinearity VIF outputs
+    # CMV: full collinearity VIF
     PLS1_CMV_SUM = PLS1_VIF_FULL = pd.DataFrame()
     PLS2_CMV_SUM = PLS2_VIF_FULL = pd.DataFrame()
+
+    # G*Power
+    PLS1_GPOWER = pd.DataFrame()
+    PLS2_GPOWER = pd.DataFrame()
 
     PLS1_BOOTPATH = PLS2_BOOTPATH = pd.DataFrame()
 
     if cfg.pls.RUN_PLS:
-        # clean-mode guards (still enforce)
         scheme_up = str(getattr(cfg.pls, "PLS_SCHEME", "PATH")).strip().upper()
         if getattr(cfg.pls, "CLEAN_MODE", True):
             if scheme_up in ("CENTROID",):
@@ -647,24 +746,26 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
         Xpls = Xpls.reset_index(drop=True)
 
-        # Full collinearity VIF controls (NEW, safe defaults)
+        # controls
         RUN_FULL_VIF = bool(getattr(cfg.pls, "RUN_FULL_COLLINEARITY_VIF", True))
         FULL_VIF_TH = float(getattr(cfg.pls, "FULL_VIF_THRESHOLD", 3.3))
         DEC = int(getattr(cfg.pls, "PAPER_DECIMALS", 3))
 
-        # --------------------------
-        # Model1 (config-controlled)
-        # --------------------------
+        RUN_GPOWER = bool(getattr(cfg.pls, "RUN_GPOWER", False))
+        GP_F2 = float(getattr(cfg.pls, "GPOWER_F2", 0.02))
+        GP_ALPHA = float(getattr(cfg.pls, "GPOWER_ALPHA", 0.05))
+        GP_POWER = float(getattr(cfg.pls, "GPOWER_POWER", 0.80))
+
         RUN_M1 = bool(getattr(cfg.pls, "RUN_MODEL1", True))
         RUN_M2 = bool(getattr(cfg.pls, "RUN_MODEL2", True))
 
         res1 = None
-        order1 = None
-        path1 = None
-        lv_blocks1 = None
-        lv_modes1 = None
+        order1 = path1 = None
         scores1 = None
 
+        # --------------------------
+        # Model1
+        # --------------------------
         if RUN_M1:
             edges1_all = list(getattr(cfg.pls, "MODEL1_EDGES", []))
             edges1 = [(a, b) for (a, b) in edges1_all if (a in groups) and (b in groups)]
@@ -708,12 +809,17 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 PLS1_Q2 = q2_cv_from_scores(scores1[order1], path1, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
                 PLS1_VIF = structural_vif(scores1[order1], path1)
 
-                # NEW: Full collinearity VIF (CMV check) — model must have scores
                 if RUN_FULL_VIF:
-                    PLS1_CMV_SUM, PLS1_VIF_FULL = full_collinearity_vif(
-                        scores1[order1],
-                        threshold=FULL_VIF_TH,
-                        decimals=DEC,
+                    PLS1_CMV_SUM, PLS1_VIF_FULL = full_collinearity_vif(scores1[order1], threshold=FULL_VIF_TH, decimals=DEC)
+
+                # ✅ G*Power table (after model exists; uses path + N actual)
+                if RUN_GPOWER:
+                    PLS1_GPOWER = gpower_table_for_path_model(
+                        path_df=path1,
+                        n_actual=int(Xpls.shape[0]),
+                        f2=GP_F2,
+                        alpha=GP_ALPHA,
+                        power=GP_POWER,
                     )
 
                 PLS1_info = pd.DataFrame([{
@@ -726,6 +832,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                     "sign_fix": bool(getattr(cfg.pls, "SIGN_FIX", True)),
                     "B(bootstrap)": int(cfg.pls.PLS_BOOT),
                     "CMV_fullVIF_th": FULL_VIF_TH if RUN_FULL_VIF else "",
+                    "GPower(f2,alpha,power)": f"{GP_F2},{GP_ALPHA},{GP_POWER}" if RUN_GPOWER else "",
                     "estimates": "outer/path from plspm model API (strict)",
                 }])
 
@@ -750,7 +857,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             }])
 
         # --------------------------
-        # Model2 (config-controlled, two-stage)
+        # Model2 (two-stage)
         # --------------------------
         if RUN_M2:
             if res1 is None or scores1 is None or order1 is None or path1 is None:
@@ -798,12 +905,10 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         order2 = topo_sort(nodes2, edges2)
                         path2 = make_plspm_path(order2, edges2)
 
-                        # build stage2 X
                         Xpls2 = Xpls.copy()
                         for lv, col in zip(comp_lvs, comp_cols):
                             Xpls2[col] = pd.to_numeric(scores1[lv], errors="coerce").to_numpy()
 
-                        # blocks/modes
                         lv_blocks2 = {}
                         for lv in order2:
                             if lv == commitment:
@@ -850,12 +955,17 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         PLS2_Q2 = q2_cv_from_scores(scores2[order2], path2, n_splits=int(cfg.pls.Q2_FOLDS), seed=int(cfg.pls.PLS_SEED))
                         PLS2_VIF = structural_vif(scores2[order2], path2)
 
-                        # NEW: Full collinearity VIF for Model2 as well
                         if RUN_FULL_VIF:
-                            PLS2_CMV_SUM, PLS2_VIF_FULL = full_collinearity_vif(
-                                scores2[order2],
-                                threshold=FULL_VIF_TH,
-                                decimals=DEC,
+                            PLS2_CMV_SUM, PLS2_VIF_FULL = full_collinearity_vif(scores2[order2], threshold=FULL_VIF_TH, decimals=DEC)
+
+                        # ✅ G*Power table (Model2)
+                        if RUN_GPOWER:
+                            PLS2_GPOWER = gpower_table_for_path_model(
+                                path_df=path2,
+                                n_actual=int(Xpls.shape[0]),
+                                f2=GP_F2,
+                                alpha=GP_ALPHA,
+                                power=GP_POWER,
                             )
 
                         PLS2_commitment = PLS2_outer[PLS2_outer["Construct"] == commitment].copy()
@@ -872,6 +982,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                             "commitment": commitment,
                             "components": ",".join(comp_lvs),
                             "CMV_fullVIF_th": FULL_VIF_TH if RUN_FULL_VIF else "",
+                            "GPower(f2,alpha,power)": f"{GP_F2},{GP_ALPHA},{GP_POWER}" if RUN_GPOWER else "",
                             "estimates": "outer/path from plspm model API (strict)",
                         }])
 
@@ -880,8 +991,8 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                                 cog,
                                 X_stage1=Xpls,
                                 path1=path1,
-                                lv_blocks1=lv_blocks1,
-                                lv_modes1=lv_modes1,
+                                lv_blocks1={lv: group_items[lv] for lv in order1},
+                                lv_modes1={lv: "A" for lv in order1},
                                 order1=order1,
                                 anchors1=res1["anchors"],
                                 commitment_name=commitment,
@@ -910,32 +1021,28 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         if cfg.io.EXPORT_EXCLUDED_SHEET and (excluded_df is not None) and (not excluded_df.empty):
             excluded_df.to_excel(writer, sheet_name="排除樣本", index=False)
 
-        # ---- Paper sheet ----
+        # ---- Paper ----
         ws = get_or_create_ws(writer, cfg.io.PAPER_SHEET)
         r = 0
         r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"A. Reliability summary (α / ωt) [{tag}]", RelTable, index=False)
-
         r = write_block(
             writer, cfg.io.PAPER_SHEET, ws, r,
             f"B. Item analysis (all constructs stacked) [{tag}]",
             ItemTable[["Construct", "Item", "n(complete)", "Mean", "SD", "CITC", "α if deleted", "ωt if deleted"]],
             index=False,
         )
-
         r = write_block(
             writer, cfg.io.PAPER_SHEET, ws, r,
             f"C. One-factor loadings (sklearn FA, all constructs stacked) [{tag}]",
             FA1Table[["Construct", "Item", "n(complete)", "Loading", "h2", "psi"]],
             index=False,
         )
-
         r = write_block(
             writer, cfg.io.PAPER_SHEET, ws, r,
             f"D. One-factor EFA per construct (factor_analyzer, all constructs stacked) [{tag}]",
             EFA1Table[["Construct", "Item", "n(complete)", "EFA Loading", "h2", "psi"]],
             index=False,
         )
-
         if EFA1Fit is not None and (not EFA1Fit.empty):
             r = write_block(
                 writer, cfg.io.PAPER_SHEET, ws, r,
@@ -943,15 +1050,13 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 EFA1Fit[["Construct", "n(complete)", "k(items)", "KMO", "Bartlett_p"]],
                 index=False,
             )
-
         if cfg.cfa.RUN_CFA:
             r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"E. CFA standardized loadings [{tag}]", CFA_Loadings, index=False)
             r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"F. CFA model info [{tag}]", CFA_Info, index=False)
             r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"G. CFA fit indices [{tag}]", CFA_Fit, index=False)
-
         ws.freeze_panes = "A2"
 
-        # ---- Extra sheets: CBSEM_WLSMV and MEASUREQ ----
+        # ---- CBSEM_WLSMV ----
         if bool(getattr(cfg.cfa, "RUN_CBSEM_WLSMV", False)):
             cb_sheet = str(getattr(cfg.io, "CBSEM_SHEET", "CBSEM_WLSMV"))
             ws_cb = get_or_create_ws(writer, cb_sheet)
@@ -965,19 +1070,35 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             rc = write_block(writer, cb_sheet, ws_cb, rc, f"F. SEM standardized paths [{tag}]", CBSEM.get("SEM_paths", pd.DataFrame()), index=False)
             ws_cb.freeze_panes = "A2"
 
+        # ---- MEASUREQ ----
         if bool(getattr(cfg.cfa, "RUN_MEASUREQ", False)):
             mq_sheet = str(getattr(cfg.io, "MEASUREQ_SHEET", "MEASUREQ"))
             ws_mq = get_or_create_ws(writer, mq_sheet)
             rm = 0
             rm = write_block(writer, mq_sheet, ws_mq, rm, f"measureQ INFO [{tag}]", MQ.get("info", pd.DataFrame()), index=False)
-
             keys = [k for k in MQ.keys() if k not in ("info",)]
             for k in keys:
                 rm = write_block(writer, mq_sheet, ws_mq, rm, f"{k} [{tag}]", MQ.get(k, pd.DataFrame()), index=False)
-
             ws_mq.freeze_panes = "A2"
 
-        # ---- PLS sheet ----
+        # ---- CMV_CLF_MLR (3rd line) ----
+        if bool(getattr(cfg.cfa, "RUN_CMV_CLF_MLR", False)):
+            cmv_sheet = str(getattr(cfg.io, "CMV_CLF_SHEET", "CMV_CLF_MLR"))
+            ws_cmv = get_or_create_ws(writer, cmv_sheet)
+            rr = 0
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"CMV-CLF INFO [{tag}]", CMV3.get("info", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"A. Baseline fit [{tag}]", CMV3.get("BASE_fit", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"B. CLF fit [{tag}]", CMV3.get("CLF_fit", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"C. Fit delta (CLF-BASE) [{tag}]", CMV3.get("DELTA_fit", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"D. Baseline standardized loadings [{tag}]", CMV3.get("BASE_loadings", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"E. CLF substantive loadings [{tag}]", CMV3.get("CLF_loadings_sub", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"F. CLF method loadings [{tag}]", CMV3.get("CLF_loadings_method", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"G. Loading delta (CLF-BASE) [{tag}]", CMV3.get("DELTA_loadings", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"H. Delta summary [{tag}]", CMV3.get("DELTA_summary", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"Z. Console log [{tag}]", CMV3.get("console_log", pd.DataFrame()), index=False)
+            ws_cmv.freeze_panes = "A2"
+
+        # ---- PLS ----
         if cfg.pls.RUN_PLS:
             ws_pls = get_or_create_ws(writer, cfg.io.PLS_SHEET)
             rp = 0
@@ -992,9 +1113,10 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Z. Q²(CV)", PLS1_Q2, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-V. Structural VIF", PLS1_VIF, index=False)
 
-            # NEW: CMV Full collinearity VIF
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-CMV. Full collinearity VIF summary", PLS1_CMV_SUM, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-CMV. Full collinearity VIF detail", PLS1_VIF_FULL, index=False)
+
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Power. G*Power (equivalent) table", PLS1_GPOWER, index=False)
 
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-ZZ. Bootstrap DIRECT paths (t/CI/Sig)", PLS1_BOOTPATH, index=False)
 
@@ -1011,31 +1133,14 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Z. Q²(CV)", PLS2_Q2, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-V. Structural VIF", PLS2_VIF, index=False)
 
-            # NEW: CMV Full collinearity VIF
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-CMV. Full collinearity VIF summary", PLS2_CMV_SUM, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-CMV. Full collinearity VIF detail", PLS2_VIF_FULL, index=False)
 
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Power. G*Power (equivalent) table", PLS2_GPOWER, index=False)
+
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-ZZ. Bootstrap DIRECT paths (t/CI/Sig)", PLS2_BOOTPATH, index=False)
+
             ws_pls.freeze_panes = "A2"
-        
-        # ==============================
-        # Extra sheet: CMV_CLF_MLR (3rd line)
-        # ==============================
-        if bool(getattr(cfg.cfa, "RUN_CMV_CLF_MLR", False)):
-            cmv_sheet = str(getattr(cfg.io, "CMV_CLF_SHEET", "CMV_CLF_MLR"))
-            ws_cmv = get_or_create_ws(writer, cmv_sheet)
-            rr = 0
-            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"CMV-CLF INFO [{tag}]", CMV3.get("info", pd.DataFrame()), index=False)
-            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"A. Baseline fit [{tag}]", CMV3.get("BASE_fit", pd.DataFrame()), index=False)
-            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"B. CLF fit [{tag}]", CMV3.get("CLF_fit", pd.DataFrame()), index=False)
-            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"C. Fit delta (CLF-BASE) [{tag}]", CMV3.get("DELTA_fit", pd.DataFrame()), index=False)
-            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"D. Baseline standardized loadings [{tag}]", CMV3.get("BASE_loadings", pd.DataFrame()), index=False)
-            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"E. CLF substantive loadings [{tag}]", CMV3.get("CLF_loadings_sub", pd.DataFrame()), index=False)
-            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"F. CLF method loadings [{tag}]", CMV3.get("CLF_loadings_method", pd.DataFrame()), index=False)
-            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"G. Loading delta (CLF-BASE) [{tag}]", CMV3.get("DELTA_loadings", pd.DataFrame()), index=False)
-            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"H. Delta summary [{tag}]", CMV3.get("DELTA_summary", pd.DataFrame()), index=False)
-            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"Z. Console log [{tag}]", CMV3.get("console_log", pd.DataFrame()), index=False)
-            ws_cmv.freeze_panes = "A2"
 
     df_valid.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
     print("✅ 已輸出：", OUT_XLSX)
