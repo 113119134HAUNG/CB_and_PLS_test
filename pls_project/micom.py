@@ -75,7 +75,6 @@ def _estimate_group_weights_via_scores(
         if not inds or lv not in scores_group.columns:
             continue
         y = pd.to_numeric(scores_group[lv], errors="coerce").to_numpy()
-        # standardize y
         y = (y - np.nanmean(y)) / (np.nanstd(y) if np.nanstd(y) > 1e-12 else np.nan)
         Xmat = Xg[inds].apply(pd.to_numeric, errors="coerce").to_numpy()
         beta = _ols_weights_no_intercept(Xmat, y)
@@ -163,9 +162,8 @@ def micom_two_group(
     n1 = int(group_mask.sum())
     n2 = int((~group_mask).sum())
 
-    # Step 1 (configural): basic checks
     step1 = pd.DataFrame([{
-        "Configural_invariance": True,  # same codepath/settings by construction
+        "Configural_invariance": True,
         "Same_indicators_per_construct": True,
         "Same_algorithm_settings": True,
         "Same_data_treatment(standardized)": bool(settings.standardized),
@@ -177,7 +175,6 @@ def micom_two_group(
         "alpha": float(settings.alpha),
     }])
 
-    # If not enough n, still return with info
     if not bool(step1.loc[0, "Pass_min_n"]):
         return {
             "info": pd.DataFrame([{"Error": "MICOM blocked: group size too small."}]),
@@ -197,11 +194,9 @@ def micom_two_group(
     m1, s1 = run_plspm_python(cog, X1, path_df, lv_blocks, lv_modes, scaled=scaled)
     m2, s2 = run_plspm_python(cog, X2, path_df, lv_blocks, lv_modes, scaled=scaled)
 
-    # weights by regression on LV scores (stable, works for A/B)
     W1 = _estimate_group_weights_via_scores(X1, s1[order], lv_blocks, order, standardized=settings.standardized)
     W2 = _estimate_group_weights_via_scores(X2, s2[order], lv_blocks, order, standardized=settings.standardized)
 
-    # sign-align to avoid -1 correlations due to arbitrary sign
     W1 = _sign_align_weights_by_anchor(X_full, W1, anchors, standardized=settings.standardized)
     W2 = _sign_align_weights_by_anchor(X_full, W2, anchors, standardized=settings.standardized)
 
@@ -209,7 +204,6 @@ def micom_two_group(
     S2_full = _scores_from_weights(X_full, W2, standardized=settings.standardized)
 
     # Step 2: original correlations
-    step2_rows = []
     orig_corr = {}
     for lv in order:
         if lv in S1_full.columns and lv in S2_full.columns:
@@ -217,8 +211,6 @@ def micom_two_group(
         else:
             c = np.nan
         orig_corr[lv] = c
-        step2_rows.append({"Construct": lv, "c_original": c})
-    step2 = pd.DataFrame(step2_rows)
 
     # Step 2: permutation distribution of correlations
     rng = np.random.default_rng(int(settings.seed))
@@ -251,15 +243,14 @@ def micom_two_group(
                 cperm = np.nan
             perm_corrs[lv].append(cperm)
 
-    # Compute p (lower-tail) and quantile for compositional invariance
     alpha = float(settings.alpha)
-    out_rows = []
+    step2_rows = []
     for lv in order:
         c0 = float(orig_corr.get(lv, np.nan))
         arr = np.asarray(perm_corrs[lv], dtype=float)
         arr = arr[np.isfinite(arr)]
         if arr.size == 0 or not np.isfinite(c0):
-            out_rows.append({
+            step2_rows.append({
                 "Construct": lv,
                 "c_original": c0,
                 "q_alpha": np.nan,
@@ -268,20 +259,18 @@ def micom_two_group(
             })
             continue
         q_alpha = float(np.quantile(arr, alpha))
-        p_lower = float(np.mean(arr <= c0))  # one-tailed (low corr = bad)
-        pass_comp = bool(p_lower >= alpha)   # equivalent to c0 >= q_alpha (up to discreteness)
-        out_rows.append({
+        p_lower = float(np.mean(arr <= c0))   # one-tailed (low corr = bad)
+        pass_comp = bool(p_lower >= alpha)    # accept invariance if not significantly low
+        step2_rows.append({
             "Construct": lv,
             "c_original": c0,
             "q_alpha": q_alpha,
             "p_lower": p_lower,
             "Pass_compositional": pass_comp,
         })
-
-    step2 = pd.DataFrame(out_rows)
+    step2 = pd.DataFrame(step2_rows)
 
     # ----- Step 3: equality of mean/variance (use pooled weights for scoring) -----
-    # pooled model weights via regression on pooled LV scores
     mp, sp = run_plspm_python(cog, X_full.reset_index(drop=True), path_df, lv_blocks, lv_modes, scaled=scaled)
     Wp = _estimate_group_weights_via_scores(
         X_full.reset_index(drop=True),
@@ -293,12 +282,9 @@ def micom_two_group(
     Wp = _sign_align_weights_by_anchor(X_full, Wp, anchors, standardized=settings.standardized)
     Sp = _scores_from_weights(X_full, Wp, standardized=settings.standardized)
 
-    # observed diffs
-    step3_rows = []
     perm_diffs_mean = {lv: [] for lv in order}
     perm_diffs_var = {lv: [] for lv in order}
 
-    # permutation diffs using fixed pooled scores (efficient & valid once compositional holds)
     idx_all = np.arange(n)
     for _ in range(int(settings.B)):
         idxp = rng.permutation(idx_all)
@@ -315,22 +301,27 @@ def micom_two_group(
             perm_diffs_mean[lv].append(m1p - m2p)
             perm_diffs_var[lv].append(v1p - v2p)
 
-    # compute observed + p/CI
+    step3_rows = []
     g1 = group_mask
+
     for lv in order:
         if lv not in Sp.columns:
             step3_rows.append({
                 "Construct": lv,
                 "mean_diff(g1-g2)": np.nan,
-                "mean_ci_lo": np.nan,
-                "mean_ci_hi": np.nan,
+                "mean_perm_ci_lo": np.nan,
+                "mean_perm_ci_hi": np.nan,
                 "mean_p_two": np.nan,
                 "Pass_mean": False,
+                "Pass_mean(p>=alpha)": False,
+                "Pass_mean(CI contains diff)": False,
                 "var_diff(g1-g2)": np.nan,
-                "var_ci_lo": np.nan,
-                "var_ci_hi": np.nan,
+                "var_perm_ci_lo": np.nan,
+                "var_perm_ci_hi": np.nan,
                 "var_p_two": np.nan,
                 "Pass_var": False,
+                "Pass_var(p>=alpha)": False,
+                "Pass_var(CI contains diff)": False,
             })
             continue
 
@@ -341,33 +332,42 @@ def micom_two_group(
         pm = np.asarray(perm_diffs_mean[lv], dtype=float)
         pv = np.asarray(perm_diffs_var[lv], dtype=float)
 
-        # two-tailed p
         mean_p = float(np.mean(np.abs(pm) >= abs(mean_diff))) if pm.size else np.nan
         var_p = float(np.mean(np.abs(pv) >= abs(var_diff))) if pv.size else np.nan
 
         mean_ci_lo, mean_ci_hi = (float(np.quantile(pm, alpha / 2)), float(np.quantile(pm, 1 - alpha / 2))) if pm.size else (np.nan, np.nan)
         var_ci_lo, var_ci_hi = (float(np.quantile(pv, alpha / 2)), float(np.quantile(pv, 1 - alpha / 2))) if pv.size else (np.nan, np.nan)
 
-        pass_mean = bool((mean_ci_lo <= 0 <= mean_ci_hi)) if np.isfinite(mean_ci_lo) and np.isfinite(mean_ci_hi) else False
-        pass_var = bool((var_ci_lo <= 0 <= var_ci_hi)) if np.isfinite(var_ci_lo) and np.isfinite(var_ci_hi) else False
+        pass_mean_p = bool(np.isfinite(mean_p) and (mean_p >= alpha))
+        pass_var_p = bool(np.isfinite(var_p) and (var_p >= alpha))
+
+        pass_mean_ci = bool(np.isfinite(mean_ci_lo) and np.isfinite(mean_ci_hi) and (mean_ci_lo <= mean_diff <= mean_ci_hi))
+        pass_var_ci = bool(np.isfinite(var_ci_lo) and np.isfinite(var_ci_hi) and (var_ci_lo <= var_diff <= var_ci_hi))
+
+        # MAIN PASS FLAG (use p-value; SmartPLS MICOM Step3 logic)
+        pass_mean = pass_mean_p
+        pass_var = pass_var_p
 
         step3_rows.append({
             "Construct": lv,
             "mean_diff(g1-g2)": mean_diff,
-            "mean_ci_lo": mean_ci_lo,
-            "mean_ci_hi": mean_ci_hi,
+            "mean_perm_ci_lo": mean_ci_lo,
+            "mean_perm_ci_hi": mean_ci_hi,
             "mean_p_two": mean_p,
             "Pass_mean": pass_mean,
+            "Pass_mean(p>=alpha)": pass_mean_p,
+            "Pass_mean(CI contains diff)": pass_mean_ci,
             "var_diff(g1-g2)": var_diff,
-            "var_ci_lo": var_ci_lo,
-            "var_ci_hi": var_ci_hi,
+            "var_perm_ci_lo": var_ci_lo,
+            "var_perm_ci_hi": var_ci_hi,
             "var_p_two": var_p,
             "Pass_var": pass_var,
+            "Pass_var(p>=alpha)": pass_var_p,
+            "Pass_var(CI contains diff)": pass_var_ci,
         })
 
     step3 = pd.DataFrame(step3_rows)
 
-    # summary: partial/full invariance
     summary_rows = []
     for lv in order:
         pass_comp = bool(step2.loc[step2["Construct"] == lv, "Pass_compositional"].iloc[0]) if (step2["Construct"] == lv).any() else False
@@ -391,7 +391,7 @@ def micom_two_group(
         "B": int(settings.B),
         "alpha": float(settings.alpha),
         "standardized_scoring": bool(settings.standardized),
-        "note": "Follow MICOM 3-step logic as described by Henseler et al. and SmartPLS docs.",
+        "note": "Step3 pass is based on two-tailed permutation p-value (p >= alpha).",
     }])
 
     return {
