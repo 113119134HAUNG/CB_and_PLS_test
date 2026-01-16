@@ -33,15 +33,11 @@ def _build_clf_model(
       - optionally constrain all method loadings equal (recommended for stability)
       - fix method variance to 1 for identification
       - optionally force CMV orthogonal to substantive factors
-
-    Returns lavaan model syntax string.
     """
     items = [str(x) for x in items]
     groups = [str(x) for x in groups]
 
-    # method factor loading line
     if equal_loadings:
-        # all method loadings share the same label m
         cmv_rhs = " + ".join([f"m*{it}" for it in items])
     else:
         cmv_rhs = " + ".join(items)
@@ -80,13 +76,6 @@ def run_cmv_clf_mlr(
       - Fit baseline measurement model (MLR + FIML)
       - Fit CLF/ULMC-like model (baseline + CMV factor)
       - Output fit indices + loading changes
-
-    Returns dict of DataFrames:
-      info,
-      BASE_fit, CLF_fit, DELTA_fit,
-      BASE_loadings, CLF_loadings_sub, CLF_loadings_method,
-      DELTA_loadings, DELTA_summary,
-      console_log
     """
     cfg = getattr(cog, "cfg", None)
     dec = int(getattr(getattr(cfg, "cfa", object()), "PAPER_DECIMALS", 3)) if cfg else 3
@@ -115,11 +104,16 @@ def run_cmv_clf_mlr(
 
         df_items.to_csv(data_csv, index=False, encoding="utf-8-sig")
 
+        # ---- write models to files (avoid multi-line string literal issues in R) ----
+        base_file = td / "model_base.txt"
+        clf_file = td / "model_clf.txt"
+        base_file.write_text(meas_model, encoding="utf-8")
+        clf_file.write_text(clf_model, encoding="utf-8")
+
         r_code = f"""
         suppressPackageStartupMessages(library(lavaan))
 
         Data <- read.csv("{data_csv.as_posix()}", check.names=FALSE, fileEncoding="UTF-8-BOM")
-
         items <- c({",".join([f'"{x}"' for x in items])})
 
         # quick check
@@ -148,17 +142,20 @@ def run_cmv_clf_mlr(
           write.csv(L, file=file, row.names=FALSE)
         }}
 
+        model_base <- paste(readLines("{base_file.as_posix()}", warn=FALSE), collapse="\\n")
+        model_clf  <- paste(readLines("{clf_file.as_posix()}", warn=FALSE), collapse="\\n")
+
         # capture console output (warnings, messages)
         sink(file.path("{out_dir.as_posix()}", "console.txt"))
         cat("=== Baseline model ===\\n")
-        cat('{meas_model.replace("'", '"')}')
+        cat(model_base)
         cat("\\n\\n=== CLF model ===\\n")
-        cat('{clf_model.replace("'", '"')}')
+        cat(model_clf)
         cat("\\n\\n")
 
         # ---- baseline ----
         fit_base <- cfa(
-          model = '{meas_model.replace("'", '"')}',
+          model = model_base,
           data = Data,
           estimator = "{estimator}",
           missing = "{missing}"
@@ -169,7 +166,7 @@ def run_cmv_clf_mlr(
 
         # ---- CLF ----
         fit_clf <- cfa(
-          model = '{clf_model.replace("'", '"')}',
+          model = model_clf,
           data = Data,
           estimator = "{estimator}",
           missing = "{missing}"
