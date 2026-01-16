@@ -29,7 +29,6 @@ def _build_sem_model(
     """
     edges: list of (from, to), meaning: to ~ from
     """
-    # group by endogenous
     to_map: Dict[str, List[str]] = {}
     for fr, to in edges:
         to_map.setdefault(to, []).append(fr)
@@ -89,10 +88,15 @@ def run_cbsem_esem_then_cfa_sem_wlsmv(
 
         df_items.to_csv(data_csv, index=False, encoding="utf-8-sig")
 
+        # ---- write models to files (avoid multi-line string literal issues in R) ----
+        cfa_file = td / "model_cfa.txt"
+        cfa_file.write_text(cfa_model, encoding="utf-8")
+
+        sem_file = td / "model_sem.txt"
+        if run_sem and sem_model.strip():
+            sem_file.write_text(sem_model, encoding="utf-8")
+
         # ---- R script ----
-        # Notes:
-        # - ordered=items triggers WLSMV in lavaan for categorical indicators
-        # - we coerce to ordered factors in R defensively
         r_code = f"""
         suppressPackageStartupMessages(library(lavaan))
 
@@ -102,7 +106,6 @@ def run_cbsem_esem_then_cfa_sem_wlsmv(
         # coerce to ordered factors (works for numeric 1..5 or strings)
         for (v in items) {{
           if (! (v %in% names(df))) stop(paste0("Missing item column: ", v))
-          # keep NA; coerce values to integer-ish if numeric
           if (is.numeric(df[[v]])) {{
             df[[v]] <- as.integer(round(df[[v]]))
           }}
@@ -149,7 +152,7 @@ def run_cbsem_esem_then_cfa_sem_wlsmv(
         write_loadings(fit_esem, file.path("{out_dir.as_posix()}", "ESEM_loadings.csv"))
 
         # ---- CFA ----
-        model_cfa <- '{cfa_model.replace("'", '"')}'
+        model_cfa <- paste(readLines("{cfa_file.as_posix()}", warn=FALSE), collapse="\\n")
         fit_cfa <- cfa(
           model_cfa,
           data=df,
@@ -162,7 +165,7 @@ def run_cbsem_esem_then_cfa_sem_wlsmv(
 
         # ---- SEM (optional) ----
         if ({'TRUE' if run_sem and sem_model.strip() else 'FALSE'}) {{
-          model_sem <- '{sem_model.replace("'", '"')}'
+          model_sem <- paste(readLines("{sem_file.as_posix()}", warn=FALSE), collapse="\\n")
           fit_sem <- sem(
             model_sem,
             data=df,
@@ -178,7 +181,6 @@ def run_cbsem_esem_then_cfa_sem_wlsmv(
         r_file = td / "run_cbsem_wlsmv.R"
         r_file.write_text(r_code, encoding="utf-8")
 
-        # ---- run ----
         subprocess.run([rscript, str(r_file)], check=True)
 
         def read_csv(name: str) -> pd.DataFrame:
