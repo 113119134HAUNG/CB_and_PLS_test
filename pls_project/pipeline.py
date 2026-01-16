@@ -38,6 +38,7 @@ from pls_project.pls_core import (
 
 from pls_project.pls_estimate import estimate_pls_basic_paper
 from pls_project.pls_bootstrap import summarize_direct_ci
+from pls_project.micom import micom_two_group, MICOMSettings
 
 from pls_project.cbsem_wlsmv import run_cbsem_esem_then_cfa_sem_wlsmv
 from pls_project.measureq_mlr import run_measureq
