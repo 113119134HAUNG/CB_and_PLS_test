@@ -40,7 +40,8 @@ class IOConfig:
     # existing sheets
     PAPER_SHEET: str = "Paper_OnePage"
     PLS_SHEET: str = "PLS_SmartPLS"
-
+    CMV_CLF_SHEET: str = "CMV_CLF_MLR"
+    
     # NEW: extra sheets for two CB-SEM lines
     CBSEM_SHEET: str = "CBSEM_WLSMV"
     MEASUREQ_SHEET: str = "MEASUREQ"
@@ -122,6 +123,14 @@ class CFAConfig:
     MEASUREQ_HTMT: bool = True             # ask measureQ to output HTMT-related table(s)
     MEASUREQ_CLUSTER: Optional[str] = None # cluster variable name (optional)
 
+     # ---- NEW: line 3 measureQ best-practice ----
+    RUN_CMV_CLF_MLR: bool = False
+    CLF_ESTIMATOR: str = "MLR"
+    CLF_MISSING: str = "ML"
+    CLF_METHOD_NAME: str = "CMV"
+    CLF_ORTHOGONAL: bool = True
+    CLF_EQUAL_LOADINGS: bool = True
+    CLF_DELTA_LOADING_FLAG: float = 0.10
 
 # ==============================
 # PLS config
