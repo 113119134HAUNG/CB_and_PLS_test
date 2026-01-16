@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Union, Tuple
+from typing import List, Dict, Union, Tuple, Optional
 
 
 # ==============================
@@ -36,8 +36,15 @@ class IOConfig:
     SHEET_NAME: Union[int, str] = 0
     OUT_XLSX_BASE: str = "/content/drive/MyDrive/前測_論文表格輸出"
     OUT_CSV_BASE: str = "/content/drive/MyDrive/BACK_scored"
+
+    # existing sheets
     PAPER_SHEET: str = "Paper_OnePage"
     PLS_SHEET: str = "PLS_SmartPLS"
+
+    # NEW: extra sheets for two CB-SEM lines
+    CBSEM_SHEET: str = "CBSEM_WLSMV"
+    MEASUREQ_SHEET: str = "MEASUREQ"
+
     EXPORT_EXCLUDED_SHEET: bool = True
     DROP_EMAIL_IN_VALID_DF: bool = True
 
@@ -82,14 +89,38 @@ class FilterConfig:
 
 
 # ==============================
-# CFA config
+# CFA / CB-SEM config
 # ==============================
 @dataclass
 class CFAConfig:
+    # ---- existing CFA switch (your current run_cfa in paper.py) ----
     RUN_CFA: bool = True
     CFA_MISSING: str = "listwise"
     CFA_OBJ: str = "MLW"
     CFA_ROBUST_SE: bool = False
+
+    # ---- NEW: paper decimals for CB-SEM/measureQ exports ----
+    PAPER_DECIMALS: int = 3
+
+    # ---- NEW: line 1 (lavaan) ESEM -> CFA/SEM with ordered/WLSMV ----
+    RUN_CBSEM_WLSMV: bool = False          # master switch
+    RUN_SEM_WLSMV: bool = True             # run SEM paths after CFA (if edges exist)
+    RSCRIPT_BIN: str = "Rscript"           # path or command name of Rscript
+
+    # ESEM settings
+    ESEM_NFACTORS: int = 0                 # 0 = auto use len(groups) in pipeline
+    ESEM_ROTATION: str = "geomin"          # geomin / oblimin / etc.
+    CBSEM_MISSING: str = "listwise"        # listwise / pairwise (lavaan option)
+
+    # SEM edges for CB-SEM line (optional).
+    # If empty, pipeline can fall back to cfg.pls.MODEL1_EDGES
+    SEM_EDGES: List[Tuple[str, str]] = field(default_factory=list)
+
+    # ---- NEW: line 2 measureQ best-practice ----
+    RUN_MEASUREQ: bool = False             # master switch
+    MEASUREQ_B_NO: int = 1000              # bootstrap repetitions in measureQ
+    MEASUREQ_HTMT: bool = True             # ask measureQ to output HTMT-related table(s)
+    MEASUREQ_CLUSTER: Optional[str] = None # cluster variable name (optional)
 
 
 # ==============================
@@ -111,7 +142,7 @@ class PLSConfig:
     PLSPM_MAX_ITER: int = 3000
     PLSPM_TOL: float = 1e-7
     PLS_MISSING: str = "listwise"   # "none" | "listwise" | "mean"
-    
+
     # ---- Correlation methods ----
     HTMT_CORR_METHOD: str = "pearson"
     PLS_CROSS_CORR_METHOD: str = "pearson"
@@ -131,6 +162,7 @@ class PLSConfig:
     BOOT_CI_HI: float = 0.975
     BOOT_ALPHA: float = 0.05
     BOOT_TEST_TYPE: str = "two-tailed"
+
     # ---- Model1 / Model2 control ----
     RUN_MODEL1: bool = True
     RUN_MODEL2: bool = True
