@@ -45,6 +45,11 @@ from pls_project.cbsem_wlsmv import run_cbsem_esem_then_cfa_sem_wlsmv
 from pls_project.measureq_mlr import run_measureq
 from pls_project.cmv_clf_mlr import run_cmv_clf_mlr
 
+# ✅ inference modules (NEW)
+from pls_project.effects_inference import edges_from_path_df, summarize_effects_bootstrap_ci
+from pls_project.htmt_inference import htmt_inference_bootstrap
+from pls_project.pls_predict import plspredict_indicator_cv
+
 
 # =========================================================
 # CMV: Full collinearity VIF (Kock-style diagnostic) on LV scores
@@ -506,6 +511,9 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         if c in df.columns:
             df[c] = df[c].apply(reverse_1to5).astype(float)
 
+    # ==============================
+    # Careless detection (missing / SD / longstring / jump)
+    # ==============================
     if FILTER_CARELESS:
         k_all = len(item_cols)
         miss_rate = df[item_cols].isna().mean(axis=1)
@@ -523,6 +531,12 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         use_sd = bool(getattr(fcfg, "CARELESS_USE_SD", True))
         use_long = bool(getattr(fcfg, "CARELESS_USE_LONGSTRING", True))
 
+        # ✅ jump filter switches
+        use_jump = bool(getattr(fcfg, "USE_JUMP_FILTER", False))
+        jump_diff = float(getattr(fcfg, "JUMP_DIFF", 3))
+        jump_rate_th = float(getattr(fcfg, "JUMP_RATE_TH", 0.80))
+        min_items_for_jump = int(getattr(fcfg, "MIN_ITEMS_FOR_JUMP", 4))
+
         cond = pd.Series(False, index=df.index)
         if use_miss:
             cond = cond | (miss_rate > cfg.filt.MAX_MISSING_RATE)
@@ -530,6 +544,19 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             cond = cond | (sd_items <= cfg.filt.MIN_SD_ITEMS)
         if use_long:
             cond = cond | (longstring >= int(np.ceil(cfg.filt.LONGSTRING_PCT * k_all)))
+
+        if use_jump:
+            def jump_rate_row(arr) -> float:
+                v = [float(x) for x in arr if pd.notna(x)]
+                if len(v) < min_items_for_jump:
+                    return 0.0
+                d = np.abs(np.diff(np.asarray(v, dtype=float)))
+                if d.size == 0:
+                    return 0.0
+                return float(np.mean(d >= jump_diff))
+
+            jump_rate = df[item_cols].apply(lambda r: jump_rate_row(r.values), axis=1)
+            cond = cond | (jump_rate >= jump_rate_th)
 
         df["_flag_careless"] = cond
 
@@ -540,7 +567,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         if FILTER_DUP and bool(r.get("_flag_dup", False)):
             reasons.append("重複填答")
         if FILTER_CARELESS and bool(r.get("_flag_careless", False)):
-            reasons.append("疑似隨意/草率(缺漏/直線/長串)")
+            reasons.append("疑似隨意/草率(缺漏/直線/長串/跳動)")
         return ";".join(reasons)
 
     df["_exclude_reason"] = df.apply(join_reasons, axis=1)
@@ -670,7 +697,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             CMV3 = {"info": pd.DataFrame([{"Error": f"CMV_CLF_MLR failed: {e}"}])}
 
     # =========================================================
-    # PLS + MICOM
+    # PLS + MICOM + Inference
     # =========================================================
     MICOM_out: dict[str, dict[str, pd.DataFrame]] = {}
 
@@ -691,6 +718,16 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     # ✅ NEW: paths_long export tables
     PLS1_PATHS = pd.DataFrame()
     PLS2_PATHS = pd.DataFrame()
+
+    # ✅ NEW: inference outputs
+    PLS1_EFF_POINT = PLS1_EFF_CI = PLS1_MED = pd.DataFrame()
+    PLS2_EFF_POINT = PLS2_EFF_CI = PLS2_MED = pd.DataFrame()
+
+    PLS1_HTMTINF_DETAIL = PLS1_HTMTINF_SUM = pd.DataFrame()
+    PLS2_HTMTINF_DETAIL = PLS2_HTMTINF_SUM = pd.DataFrame()
+
+    PLS1_PRED_DETAIL = PLS1_PRED_SUM = pd.DataFrame()
+    PLS2_PRED_DETAIL = PLS2_PRED_SUM = pd.DataFrame()
 
     if cfg.pls.RUN_PLS:
         scheme_up = str(getattr(cfg.pls, "PLS_SCHEME", "PATH")).strip().upper()
@@ -736,6 +773,15 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         RUN_M1 = bool(getattr(cfg.pls, "RUN_MODEL1", True))
         RUN_M2 = bool(getattr(cfg.pls, "RUN_MODEL2", True))
 
+        # ✅ inference switches (default ON; can override in config)
+        RUN_EFFECTS = bool(getattr(cfg.pls, "RUN_EFFECTS_INFERENCE", True))
+        RUN_HTMT_INF = bool(getattr(cfg.pls, "RUN_HTMT_INFERENCE", True))
+        RUN_PREDICT = bool(getattr(cfg.pls, "RUN_PLS_PREDICT", True))
+
+        HTMT_BOOT = int(getattr(cfg.pls, "HTMT_BOOT", 200))
+        HTMT_TH = float(getattr(cfg.pls, "HTMT_THRESHOLD", 0.90))
+        PRED_FOLDS = int(getattr(cfg.pls, "PREDICT_FOLDS", 10))
+
         res1 = None
         order1 = None
         path1 = None
@@ -779,7 +825,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 scores1 = res1["scores"]
                 PLS1_PATHS = res1.get("paths_long", pd.DataFrame()).copy()
 
-                # ✅ htmt_matrix no longer rounds internally; round at output layer
+                # htmt_matrix no longer rounds internally; round at output layer
                 PLS1_htmt = htmt_matrix(
                     Xpls[item_cols],
                     {g: lv_blocks1[g] for g in order1},
@@ -804,7 +850,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                     )
 
                 # ==============================
-                # ✅ MICOM (before MGA)
+                # MICOM (before MGA)
                 # ==============================
                 RUN_MICOM = bool(getattr(cfg.mga, "RUN_MICOM", False))
                 if RUN_MICOM:
@@ -851,7 +897,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                             X_use = Xpls
                             note = f"{src}; numeric_ratio={num_ratio:.2f}; median split @ {thr:.4f}"
                         else:
-                            # categorical -> top2 levels only
                             s = v.astype(str).fillna("NA")
                             levels = s.value_counts().index.tolist()
                             if len(levels) < 2:
@@ -884,6 +929,45 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         except Exception as e:
                             MICOM_out[sv] = {"info": pd.DataFrame([{"Error": f"MICOM failed ({sv}): {e}"}])}
 
+                # ==============================
+                # ✅ Inference (Model1)
+                # ==============================
+                if RUN_HTMT_INF:
+                    try:
+                        PLS1_HTMTINF_DETAIL, PLS1_HTMTINF_SUM = htmt_inference_bootstrap(
+                            X_items=Xpls[item_cols],
+                            group_items={g: lv_blocks1[g] for g in order1},
+                            groups=order1,
+                            B=HTMT_BOOT,
+                            seed=int(cfg.pls.PLS_SEED),
+                            qlo=float(getattr(cfg.pls, "BOOT_CI_LO", 0.025)),
+                            qhi=float(getattr(cfg.pls, "BOOT_CI_HI", 0.975)),
+                            threshold=HTMT_TH,
+                            corr_method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
+                        )
+                        PLS1_HTMTINF_DETAIL = PLS1_HTMTINF_DETAIL.round(DEC)
+                        PLS1_HTMTINF_SUM = PLS1_HTMTINF_SUM.round(DEC)
+                    except Exception as e:
+                        PLS1_HTMTINF_SUM = pd.DataFrame([{"Error": f"HTMT inference failed: {e}"}])
+
+                if RUN_PREDICT:
+                    try:
+                        PLS1_PRED_DETAIL, PLS1_PRED_SUM = plspredict_indicator_cv(
+                            cog,
+                            X_items=Xpls[item_cols],
+                            path_df=path1,
+                            lv_blocks=lv_blocks1,
+                            lv_modes=lv_modes1,
+                            order=order1,
+                            n_splits=PRED_FOLDS,
+                            seed=int(cfg.pls.PLS_SEED),
+                            exclude_endogenous=None,
+                        )
+                        PLS1_PRED_DETAIL = PLS1_PRED_DETAIL.round(DEC)
+                        PLS1_PRED_SUM = PLS1_PRED_SUM.round(DEC)
+                    except Exception as e:
+                        PLS1_PRED_SUM = pd.DataFrame([{"Error": f"PLSpredict failed: {e}"}])
+
                 PLS1_info = pd.DataFrame([{
                     "Model": f"Model1 [{tag}]",
                     "profile": profile_name,
@@ -896,6 +980,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                     "CMV_fullVIF_th": FULL_VIF_TH if RUN_FULL_VIF else "",
                     "GPower(f2,alpha,power)": f"{GP_F2},{GP_ALPHA},{GP_POWER}" if RUN_GPOWER else "",
                     "MICOM": bool(getattr(cfg.mga, "RUN_MICOM", False)),
+                    "Inference(Effects/HTMT/PLSpredict)": f"{RUN_EFFECTS}/{RUN_HTMT_INF}/{RUN_PREDICT}",
                     "estimates": "outer/path from plspm model API (strict)",
                 }])
 
@@ -911,6 +996,25 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         anchors=res1["anchors"],
                     )
                     PLS1_BOOTPATH = summarize_direct_ci(cog, res1["key"], res1["est"], boot1)
+
+                    if RUN_EFFECTS:
+                        try:
+                            edges_for_eff = edges_from_path_df(path1)
+                            PLS1_EFF_POINT, PLS1_EFF_CI, PLS1_MED = summarize_effects_bootstrap_ci(
+                                order=order1,
+                                edges=edges_for_eff,
+                                key_df=res1["key"],
+                                point_est=res1["est"],
+                                boot=boot1,
+                                qlo=float(getattr(cfg.pls, "BOOT_CI_LO", 0.025)),
+                                qhi=float(getattr(cfg.pls, "BOOT_CI_HI", 0.975)),
+                                alpha=float(getattr(cfg.pls, "BOOT_ALPHA", 0.05)),
+                            )
+                            PLS1_EFF_POINT = PLS1_EFF_POINT.round(DEC)
+                            PLS1_EFF_CI = PLS1_EFF_CI.round(DEC)
+                            PLS1_MED = PLS1_MED.round(DEC)
+                        except Exception as e:
+                            PLS1_EFF_CI = pd.DataFrame([{"Error": f"Effects inference failed: {e}"}])
 
         else:
             PLS1_info = pd.DataFrame([{
@@ -1032,6 +1136,45 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
                         PLS2_commitment = PLS2_outer[PLS2_outer["Construct"] == commitment].copy()
 
+                        # ==============================
+                        # ✅ Inference (Model2)
+                        # ==============================
+                        if RUN_HTMT_INF and refl2:
+                            try:
+                                PLS2_HTMTINF_DETAIL, PLS2_HTMTINF_SUM = htmt_inference_bootstrap(
+                                    X_items=Xpls[item_cols],
+                                    group_items={g: group_items[g] for g in refl2},
+                                    groups=refl2,
+                                    B=HTMT_BOOT,
+                                    seed=int(cfg.pls.PLS_SEED),
+                                    qlo=float(getattr(cfg.pls, "BOOT_CI_LO", 0.025)),
+                                    qhi=float(getattr(cfg.pls, "BOOT_CI_HI", 0.975)),
+                                    threshold=HTMT_TH,
+                                    corr_method=str(getattr(cfg.pls, "HTMT_CORR_METHOD", "pearson")),
+                                )
+                                PLS2_HTMTINF_DETAIL = PLS2_HTMTINF_DETAIL.round(DEC)
+                                PLS2_HTMTINF_SUM = PLS2_HTMTINF_SUM.round(DEC)
+                            except Exception as e:
+                                PLS2_HTMTINF_SUM = pd.DataFrame([{"Error": f"HTMT inference failed: {e}"}])
+
+                        if RUN_PREDICT:
+                            try:
+                                PLS2_PRED_DETAIL, PLS2_PRED_SUM = plspredict_indicator_cv(
+                                    cog,
+                                    X_items=Xpls2[stage2_indicators],
+                                    path_df=path2,
+                                    lv_blocks=lv_blocks2,
+                                    lv_modes=lv_modes2,
+                                    order=order2,
+                                    n_splits=PRED_FOLDS,
+                                    seed=int(cfg.pls.PLS_SEED),
+                                    exclude_endogenous=None,
+                                )
+                                PLS2_PRED_DETAIL = PLS2_PRED_DETAIL.round(DEC)
+                                PLS2_PRED_SUM = PLS2_PRED_SUM.round(DEC)
+                            except Exception as e:
+                                PLS2_PRED_SUM = pd.DataFrame([{"Error": f"PLSpredict failed: {e}"}])
+
                         PLS2_info = pd.DataFrame([{
                             "Model": f"Model2 [{tag}]",
                             "profile": profile_name,
@@ -1045,6 +1188,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                             "components": ",".join(comp_lvs),
                             "CMV_fullVIF_th": FULL_VIF_TH if RUN_FULL_VIF else "",
                             "GPower(f2,alpha,power)": f"{GP_F2},{GP_ALPHA},{GP_POWER}" if RUN_GPOWER else "",
+                            "Inference(Effects/HTMT/PLSpredict)": f"{RUN_EFFECTS}/{RUN_HTMT_INF}/{RUN_PREDICT}",
                             "estimates": "outer/path from plspm model API (strict)",
                         }])
 
@@ -1068,6 +1212,25 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                                 key2=res2["key"],
                             )
                             PLS2_BOOTPATH = summarize_direct_ci(cog, res2["key"], res2["est"], boot2)
+
+                            if RUN_EFFECTS:
+                                try:
+                                    edges_for_eff2 = edges_from_path_df(path2)
+                                    PLS2_EFF_POINT, PLS2_EFF_CI, PLS2_MED = summarize_effects_bootstrap_ci(
+                                        order=order2,
+                                        edges=edges_for_eff2,
+                                        key_df=res2["key"],
+                                        point_est=res2["est"],
+                                        boot=boot2,
+                                        qlo=float(getattr(cfg.pls, "BOOT_CI_LO", 0.025)),
+                                        qhi=float(getattr(cfg.pls, "BOOT_CI_HI", 0.975)),
+                                        alpha=float(getattr(cfg.pls, "BOOT_ALPHA", 0.05)),
+                                    )
+                                    PLS2_EFF_POINT = PLS2_EFF_POINT.round(DEC)
+                                    PLS2_EFF_CI = PLS2_EFF_CI.round(DEC)
+                                    PLS2_MED = PLS2_MED.round(DEC)
+                                except Exception as e:
+                                    PLS2_EFF_CI = pd.DataFrame([{"Error": f"Effects inference failed: {e}"}])
 
         else:
             PLS2_info = pd.DataFrame([{
@@ -1118,7 +1281,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"G. CFA fit indices [{tag}]", CFA_Fit, index=False)
         ws.freeze_panes = "A2"
 
-        # ---- MICOM (NEW) ----
+        # ---- MICOM ----
         if bool(getattr(cfg.mga, "RUN_MICOM", False)):
             micom_sheet = str(getattr(cfg.io, "MICOM_SHEET", "MICOM"))
             ws_micom = get_or_create_ws(writer, micom_sheet)
@@ -1189,13 +1352,15 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             ws_pls = get_or_create_ws(writer, cfg.io.PLS_SHEET)
             rp = 0
 
+            # ===== Model 1 =====
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "MODEL 1", PLS1_info, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-A. Outer model (model API)", PLS1_outer, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-B. CR / AVE", PLS1_quality, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-C. HTMT", PLS1_htmt, index=True)
-            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-D. Cross-loadings (LV scores corr)", PLS1_cross, index=True)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-CI. HTMT inference summary", PLS1_HTMTINF_SUM, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-CI. HTMT inference detail", PLS1_HTMTINF_DETAIL, index=False)
 
-            # ✅ NEW: raw path coefficients table
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-D. Cross-loadings (LV scores corr)", PLS1_cross, index=True)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Paths. Path coefficients (model API)", PLS1_PATHS, index=False)
 
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-X. R²", PLS1_R2, index=False)
@@ -1208,18 +1373,27 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Power. G*Power (equivalent) table", PLS1_GPOWER, index=False)
 
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Predict. PLSpredict summary", PLS1_PRED_SUM, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Predict. PLSpredict detail", PLS1_PRED_DETAIL, index=False)
+
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-ZZ. Bootstrap DIRECT paths (t/CI/Sig)", PLS1_BOOTPATH, index=False)
+
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Effects. Point (direct/indirect/total/VAF)", PLS1_EFF_POINT, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Effects. Bootstrap CI (indirect/total)", PLS1_EFF_CI, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M1-Effects. Mediation (VAF label)", PLS1_MED, index=False)
 
             rp += 2
 
+            # ===== Model 2 =====
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "MODEL 2", PLS2_info, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-A. Commitment outer (model API)", PLS2_commitment, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-B. Outer model (model API)", PLS2_outer, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-C. CR / AVE", PLS2_quality, index=False)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-D. HTMT", PLS2_htmt, index=True)
-            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-E. Cross-loadings (LV scores corr)", PLS2_cross, index=True)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-CI. HTMT inference summary", PLS2_HTMTINF_SUM, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-CI. HTMT inference detail", PLS2_HTMTINF_DETAIL, index=False)
 
-            # ✅ NEW: raw path coefficients table
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-E. Cross-loadings (LV scores corr)", PLS2_cross, index=True)
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Paths. Path coefficients (model API)", PLS2_PATHS, index=False)
 
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-X. R²", PLS2_R2, index=False)
@@ -1232,7 +1406,14 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
 
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Power. G*Power (equivalent) table", PLS2_GPOWER, index=False)
 
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Predict. PLSpredict summary", PLS2_PRED_SUM, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Predict. PLSpredict detail", PLS2_PRED_DETAIL, index=False)
+
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-ZZ. Bootstrap DIRECT paths (t/CI/Sig)", PLS2_BOOTPATH, index=False)
+
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Effects. Point (direct/indirect/total/VAF)", PLS2_EFF_POINT, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Effects. Bootstrap CI (indirect/total)", PLS2_EFF_CI, index=False)
+            rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-Effects. Mediation (VAF label)", PLS2_MED, index=False)
 
             ws_pls.freeze_panes = "A2"
 
