@@ -8,7 +8,6 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-
 def _build_measurement_model(groups: List[str], group_items: Dict[str, List[str]]) -> str:
     lines = []
     for g in groups:
@@ -193,7 +192,11 @@ def run_cmv_clf_mlr(
         r_file = td / "run_cmv_clf_mlr.R"
         r_file.write_text(r_code, encoding="utf-8")
 
-        subprocess.run([rscript, str(r_file)], check=True)
+        proc = subprocess.run([rscript, str(r_file)], capture_output=True, text=True)
+        (out_dir / "r_stdout.txt").write_text(proc.stdout or "", encoding="utf-8", errors="replace")
+        (out_dir / "r_stderr.txt").write_text(proc.stderr or "", encoding="utf-8", errors="replace")
+        if proc.returncode != 0:
+            raise RuntimeError(f"R failed with code={proc.returncode}. See r_stderr.txt in {out_dir}")
 
         def read_csv(name: str) -> pd.DataFrame:
             p = out_dir / name
