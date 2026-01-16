@@ -278,7 +278,6 @@ def _bootstrap_paths_two_stage_model2(
     lv_modes1: dict,
     order1: list[str],
     anchors1: dict,
-    commitment_name: str,
     comp_lvs: list[str],
     comp_cols: list[str],
     path2: pd.DataFrame,
@@ -318,7 +317,7 @@ def _bootstrap_paths_two_stage_model2(
 
                 if sign_fix_on and anchors1:
                     sign_map1b = get_sign_map_by_anchors(Xb, s1b, anchors1)
-                    s1b = _apply_sign_to_scores(s1b, sign_map1b)
+                    s1b = apply_sign_to_scores(s1b, sign_map1b)
 
                 for lv in comp_lvs:
                     if lv not in s1b.columns:
@@ -1181,7 +1180,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                                 lv_modes1={lv: "A" for lv in order1},
                                 order1=order1,
                                 anchors1=res1["anchors"],
-                                commitment_name=commitment,
                                 comp_lvs=comp_lvs,
                                 comp_cols=comp_cols,
                                 path2=path2,
