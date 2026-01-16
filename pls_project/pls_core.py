@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import subprocess
+from collections import deque
 from typing import Dict, List, Tuple, Optional, Iterable, Any
 
 import numpy as np
@@ -23,10 +24,11 @@ def topo_sort(nodes: Iterable[str], edges: List[Tuple[str, str]]) -> List[str]:
             adj[a].append(b)
             indeg[b] += 1
 
-    q = [n for n in nodes if indeg[n] == 0]
-    out = []
+    q = deque([n for n in nodes if indeg[n] == 0])
+    out: List[str] = []
+
     while q:
-        n = q.pop(0)
+        n = q.popleft()
         out.append(n)
         for m in adj[n]:
             indeg[m] -= 1
@@ -214,28 +216,33 @@ def htmt_matrix(
 ) -> pd.DataFrame:
     """
     NOTE: 不要在這裡 round；caller 決定輸出精度（推論用的 bootstrap 需要高精度）。
+    Optimized: precompute within-construct mean correlations (mA/mB) once.
     """
     R = X_items.corr(method=method).abs()
-    out = pd.DataFrame(index=groups_list, columns=groups_list, dtype=float)
+    G = list(groups_list)
 
-    for i, ga in enumerate(groups_list):
-        A = group_items_dict[ga]
-        RA = R.loc[A, A].values
+    within_mean: Dict[str, float] = {}
+    for g in G:
+        A = group_items_dict[g]
+        RA = R.loc[A, A].to_numpy(dtype=float)
         triA = RA[np.triu_indices_from(RA, k=1)]
-        mA = np.nanmean(triA) if triA.size else np.nan
+        within_mean[g] = float(np.nanmean(triA)) if triA.size else np.nan
 
-        for j, gb in enumerate(groups_list):
+    out = pd.DataFrame(index=G, columns=G, dtype=float)
+    for i, ga in enumerate(G):
+        A = group_items_dict[ga]
+        mA = within_mean.get(ga, np.nan)
+
+        for j, gb in enumerate(G):
             if i == j:
                 out.loc[ga, gb] = 1.0
                 continue
 
             B = group_items_dict[gb]
-            RB = R.loc[B, B].values
-            triB = RB[np.triu_indices_from(RB, k=1)]
-            mB = np.nanmean(triB) if triB.size else np.nan
+            mB = within_mean.get(gb, np.nan)
 
-            HAB = R.loc[A, B].values
-            mAB = np.nanmean(HAB) if HAB.size else np.nan
+            HAB = R.loc[A, B].to_numpy(dtype=float)
+            mAB = float(np.nanmean(HAB)) if HAB.size else np.nan
 
             denom = np.sqrt(mA * mB) if (pd.notna(mA) and pd.notna(mB) and mA > 0 and mB > 0) else np.nan
             out.loc[ga, gb] = float(mAB / denom) if pd.notna(denom) else np.nan
@@ -266,6 +273,17 @@ def _ensure_df(x) -> Optional[pd.DataFrame]:
         return pd.DataFrame(x)
     except Exception:
         return None
+
+
+def apply_sign_to_scores(scores_df: pd.DataFrame, sign_map: Dict[str, int]) -> pd.DataFrame:
+    """Flip LV scores using sign_map (+1/-1)."""
+    if scores_df is None or scores_df.empty or not sign_map:
+        return scores_df
+    out = scores_df.copy()
+    for lv, s in sign_map.items():
+        if lv in out.columns and int(s) == -1:
+            out[lv] = -out[lv]
+    return out
 
 
 def get_sign_map_by_anchors(X_df: pd.DataFrame, scores_df: pd.DataFrame, anchors: Dict[str, str]) -> Dict[str, int]:
@@ -324,7 +342,6 @@ def get_path_results(
     cand = _maybe_call(cand)
     M = _ensure_df(cand)
 
-    # matrix form (index=to, columns=from)
     if M is not None and (set(path_df.index).issubset(set(M.index)) and set(path_df.columns).issubset(set(M.columns))):
         rows = []
         for to in path_df.index:
@@ -333,7 +350,6 @@ def get_path_results(
                     rows.append({"from": fr, "to": to, "estimate": float(M.loc[to, fr])})
         return pd.DataFrame(rows)
 
-    # long form
     if M is not None:
         cols = {c.lower(): c for c in M.columns}
         if ("from" in cols and "to" in cols) and ("estimate" in cols or "path" in cols or "coef" in cols):
@@ -365,6 +381,9 @@ def get_outer_results(
     """
     Robust outer extraction from plspm model API.
 
+    Fix: ensure matrix index/columns are cast to str BEFORE lookup,
+         to avoid silent NaN due to dtype mismatch (e.g., Index not str).
+
     Tries, in order:
       1) model.outer_model() / model.crossloadings() as "long table"
       2) same candidates as "matrix" (indicator x construct)
@@ -373,10 +392,11 @@ def get_outer_results(
          strict=False -> corr fallback
     """
     expected_lvs = list(scores_df.columns) if scores_df is not None else list(lv_blocks.keys())
-    expected_lvs = [lv for lv in expected_lvs if lv in lv_blocks or lv in expected_lvs]
-    expected_inds = []
+    expected_lvs = [str(lv) for lv in expected_lvs]
+    expected_inds: List[str] = []
     for lv in expected_lvs:
         for it in lv_blocks.get(lv, []):
+            it = str(it)
             if it not in expected_inds:
                 expected_inds.append(it)
 
@@ -438,21 +458,30 @@ def get_outer_results(
     def _looks_like_matrix(DF: pd.DataFrame) -> bool:
         if DF is None or DF.empty:
             return False
-        ind_hit = len(set(expected_inds) & set(map(str, DF.index)))
-        lv_hit = len(set(expected_lvs) & set(map(str, DF.columns)))
+        idx = list(map(str, DF.index))
+        cols = list(map(str, DF.columns))
+        ind_hit = len(set(expected_inds) & set(idx))
+        lv_hit = len(set(expected_lvs) & set(cols))
         if ind_hit > 0 and lv_hit > 0:
             return True
-        ind_hit2 = len(set(expected_inds) & set(map(str, DF.columns)))
-        lv_hit2 = len(set(expected_lvs) & set(map(str, DF.index)))
+        ind_hit2 = len(set(expected_inds) & set(cols))
+        lv_hit2 = len(set(expected_lvs) & set(idx))
         return (ind_hit2 > 0 and lv_hit2 > 0)
 
     def _matrix_to_outer(M: pd.DataFrame) -> pd.DataFrame:
-        if set(expected_inds).issubset(set(map(str, M.index))) and set(expected_lvs).issubset(set(map(str, M.columns))):
-            Mat = M.copy()
-        elif set(expected_lvs).issubset(set(map(str, M.index))) and set(expected_inds).issubset(set(map(str, M.columns))):
-            Mat = M.T.copy()
+        # critical: cast to str to avoid silent mismatch
+        M2 = M.copy()
+        M2.index = M2.index.map(str)
+        M2.columns = M2.columns.map(str)
+
+        if set(expected_inds).issubset(set(M2.index)) and set(expected_lvs).issubset(set(M2.columns)):
+            Mat = M2
+        elif set(expected_lvs).issubset(set(M2.index)) and set(expected_inds).issubset(set(M2.columns)):
+            Mat = M2.T.copy()
+            Mat.index = Mat.index.map(str)
+            Mat.columns = Mat.columns.map(str)
         else:
-            A = M.to_numpy()
+            A = M2.to_numpy(dtype=float, copy=False)
             if A.shape == (len(expected_inds), len(expected_lvs)):
                 Mat = pd.DataFrame(A, index=expected_inds, columns=expected_lvs)
             elif A.shape == (len(expected_lvs), len(expected_inds)):
@@ -460,10 +489,14 @@ def get_outer_results(
             else:
                 raise ValueError("Cannot align matrix to indicators x constructs.")
 
+        Mat.index = Mat.index.map(str)
+        Mat.columns = Mat.columns.map(str)
+
         rows = []
         for lv in expected_lvs:
             mode = str(lv_modes.get(lv, "A")).upper()
             for it in lv_blocks.get(lv, []):
+                it = str(it)
                 ol = np.nan
                 if (it in Mat.index) and (lv in Mat.columns):
                     ol = pd.to_numeric(Mat.loc[it, lv], errors="coerce")
@@ -562,6 +595,8 @@ def get_outer_results(
     for lv, inds in lv_blocks.items():
         mode = str(lv_modes.get(lv, "A")).upper()
         for it in inds:
+            it = str(it)
+            lv = str(lv)
             if it not in cross.index or lv not in cross.columns:
                 continue
             ol = float(cross.loc[it, lv])
@@ -585,20 +620,36 @@ def preds_for_endogenous(path_df: pd.DataFrame, to: str) -> List[str]:
 
 def ols_fit(y: np.ndarray, X: np.ndarray) -> Tuple[np.ndarray, float]:
     """
-    OLS with intercept:
+    OLS with intercept (listwise finite):
       y = b0 + b1 x1 + ... + bp xp
-    Returns (beta, R2)
+    Returns (beta, R2).
+    If insufficient valid rows -> beta all NaN, R2 NaN.
     """
-    y = np.asarray(y, dtype=float).reshape(-1, 1)
-    X = np.asarray(X, dtype=float)
-    X1 = np.column_stack([np.ones((X.shape[0], 1)), X])
+    y0 = np.asarray(y, dtype=float).ravel()
+    X0 = np.asarray(X, dtype=float)
 
-    beta = np.linalg.lstsq(X1, y, rcond=None)[0].flatten()
-    yhat = (X1 @ beta.reshape(-1, 1)).flatten()
-    y0 = y.flatten()
+    if X0.ndim == 1:
+        X0 = X0.reshape(-1, 1)
 
-    sse = float(np.sum((y0 - yhat) ** 2))
-    sst = float(np.sum((y0 - np.mean(y0)) ** 2))
+    if y0.shape[0] != X0.shape[0]:
+        raise ValueError("ols_fit: y and X must have same number of rows.")
+
+    ok = np.isfinite(y0) & np.isfinite(X0).all(axis=1)
+    p = int(X0.shape[1])
+    min_n = max(5, p + 2)
+
+    if int(ok.sum()) < min_n:
+        return np.full((p + 1,), np.nan, dtype=float), np.nan
+
+    yv = y0[ok]
+    Xv = X0[ok]
+    X1 = np.column_stack([np.ones((Xv.shape[0], 1)), Xv])
+
+    beta = np.linalg.lstsq(X1, yv, rcond=None)[0].astype(float)
+    yhat = (X1 @ beta).astype(float)
+
+    sse = float(np.sum((yv - yhat) ** 2))
+    sst = float(np.sum((yv - np.mean(yv)) ** 2))
     r2 = 1 - sse / sst if sst > 1e-12 else np.nan
     return beta, float(r2)
 
@@ -610,6 +661,8 @@ def path_estimates_from_scores(scores_df: pd.DataFrame, path_df: pd.DataFrame) -
         if len(preds) == 0 or to not in scores_df.columns:
             continue
         beta, _ = ols_fit(scores_df[to].values, scores_df[preds].values)
+        if not np.isfinite(beta).all():
+            continue
         for j, fr in enumerate(preds):
             rows.append({"from": fr, "to": to, "estimate": float(beta[1 + j])})
     return pd.DataFrame(rows)
@@ -632,7 +685,7 @@ def r2_f2_from_scores(scores_df: pd.DataFrame, path_df: pd.DataFrame) -> Tuple[p
             else:
                 _, r2_ex = ols_fit(scores_df[to].values, scores_df[preds_ex].values)
             denom = (1 - r2_full)
-            f2 = (r2_full - r2_ex) / denom if denom > 1e-12 else np.nan
+            f2 = (r2_full - r2_ex) / denom if (np.isfinite(r2_full) and np.isfinite(r2_ex) and denom > 1e-12) else np.nan
             f2_rows.append({"from": p, "to": to, "f2": f2, "R2_full": r2_full, "R2_excluded": r2_ex})
 
     return pd.DataFrame(r2_rows).round(4), pd.DataFrame(f2_rows).round(4)
@@ -647,6 +700,7 @@ def q2_cv_from_scores(
 ) -> pd.DataFrame:
     """
     Cross-validated Q² (NOT SmartPLS blindfolding Q²).
+    NaN-safe: listwise finite masking on test rows.
     """
     n = scores_df.shape[0]
     k = max(2, min(int(n_splits), int(n)))
@@ -658,19 +712,29 @@ def q2_cv_from_scores(
         if len(preds) == 0 or to not in scores_df.columns:
             continue
 
-        y = scores_df[to].values.astype(float)
-        X = scores_df[preds].values.astype(float)
+        y = scores_df[to].to_numpy(dtype=float)
+        X = scores_df[preds].to_numpy(dtype=float)
 
         sse, sso = 0.0, 0.0
-        y_mean = float(np.mean(y))
 
         for tr, te in kf.split(X):
             beta, _ = ols_fit(y[tr], X[tr])
-            Xte1 = np.column_stack([np.ones((len(te), 1)), X[te]])
-            yhat = (Xte1 @ beta.reshape(-1, 1)).flatten()
+            if not np.isfinite(beta).all():
+                continue
+
+            Xte = X[te]
             yte = y[te]
-            sse += float(np.sum((yte - yhat) ** 2))
-            sso += float(np.sum((yte - y_mean) ** 2))
+            Xte1 = np.column_stack([np.ones((len(te), 1)), Xte])
+            yhat = (Xte1 @ beta.reshape(-1, 1)).ravel()
+
+            y_mean_tr = float(np.nanmean(y[tr]))  # train mean (NaN-safe)
+
+            ok = np.isfinite(yte) & np.isfinite(yhat)
+            if int(ok.sum()) == 0:
+                continue
+
+            sse += float(np.sum((yte[ok] - yhat[ok]) ** 2))
+            sso += float(np.sum((yte[ok] - y_mean_tr) ** 2))
 
         q2 = 1 - sse / sso if sso > 1e-12 else np.nan
         rows.append({"Construct": to, "Q2_CV": q2, "Predictors": ", ".join(preds), "folds": k})
@@ -682,6 +746,7 @@ def structural_vif(scores_df: pd.DataFrame, path_df: pd.DataFrame) -> pd.DataFra
     """
     Inner VIF (structural VIF) based on LV scores:
       VIF_x = 1 / (1 - R2_x|others)
+    NaN-safe via ols_fit listwise.
     """
     rows = []
     for to in path_df.index:
@@ -694,12 +759,12 @@ def structural_vif(scores_df: pd.DataFrame, path_df: pd.DataFrame) -> pd.DataFra
         for x in preds:
             others = [p for p in preds if p != x]
             _, r2 = ols_fit(scores_df[x].values, scores_df[others].values)
-            vif = 1.0 / (1.0 - r2) if (1.0 - r2) > 1e-12 else np.inf
+            vif = 1.0 / (1.0 - r2) if (pd.notna(r2) and (1.0 - r2) > 1e-12) else np.inf
             rows.append({"Endogenous": to, "Predictor": x, "VIF": vif})
 
     out = pd.DataFrame(rows)
     if not out.empty:
-        out["VIF"] = out["VIF"].round(3)
+        out["VIF"] = pd.to_numeric(out["VIF"], errors="coerce").round(3)
     return out
 
 
@@ -711,6 +776,10 @@ def effects_total_indirect(
     edges: List[Tuple[str, str]],
     coef_map: Dict[Tuple[str, str], float],
 ) -> Tuple[pd.DataFrame, List[Tuple[str, str]]]:
+    """
+    NaN-safe:
+      - treat non-finite coefficients as 0, preventing NaN contagion across paths.
+    """
     out_adj = {u: [] for u in order_nodes}
     for u, v in edges:
         if u in out_adj:
@@ -734,7 +803,8 @@ def effects_total_indirect(
         eff[s] = 1.0
         for u in order_nodes:
             for v in out_adj.get(u, []):
-                b = float(coef_map.get((u, v), 0.0))
+                b = coef_map.get((u, v), 0.0)
+                b = float(b) if (b is not None and np.isfinite(b)) else 0.0
                 eff[v] += eff[u] * b
         for t in order_nodes:
             if t != s:
@@ -742,7 +812,8 @@ def effects_total_indirect(
 
     rows = []
     for s, t in pairs:
-        direct = float(coef_map.get((s, t), 0.0))
+        direct = coef_map.get((s, t), 0.0)
+        direct = float(direct) if (direct is not None and np.isfinite(direct)) else 0.0
         tot = float(total.get((s, t), 0.0))
         indir = tot - direct
         rows.append({"from": s, "to": t, "direct": direct, "indirect": indir, "total": tot})
