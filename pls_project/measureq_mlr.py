@@ -1,60 +1,114 @@
 # pls_project/measureq_mlr.py
 from __future__ import annotations
-import subprocess, tempfile
+
+import subprocess
+import tempfile
 from pathlib import Path
+from typing import Dict, List, Optional
+
 import pandas as pd
 
-def run_measureq_mlr(
-    df: pd.DataFrame,
-    items: list[str],
+
+def run_measureq(
+    cog,
+    df_items: pd.DataFrame,
     *,
-    cfa_model: str,
-    bootstrap: int,
+    model_syntax: str,
+    items: List[str],
+    b_no: int = 1000,
+    htmt: bool = True,
+    cluster: Optional[str] = None,
     rscript: str = "Rscript",
-) -> dict[str, pd.DataFrame]:
+) -> Dict[str, pd.DataFrame]:
+    """
+    Runs measureQ(Model, Data, b.no=..., HTMT="TRUE"/"FALSE", cluster=...)
+    and exports any returned tables (if available) + a console log.
+
+    Returns dict of DataFrames:
+      info, measureQ_log, plus any tables discovered as CSVs.
+    """
+    cfg = getattr(cog, "cfg", None)
+    dec = int(getattr(getattr(cfg, "cfa", object()), "PAPER_DECIMALS", 4)) if cfg else 4
+
+    items = [str(x) for x in items]
+    model_syntax = (model_syntax or "").strip()
+    if not model_syntax:
+        raise ValueError("measureQ requires non-empty model_syntax (measurement model).")
+
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         data_csv = td / "data.csv"
         out_dir = td / "out"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        df.to_csv(data_csv, index=False, encoding="utf-8-sig")
+        df_items.to_csv(data_csv, index=False, encoding="utf-8-sig")
+
+        cluster_arg = f', cluster="{cluster}"' if cluster else ""
+        htmt_arg = "TRUE" if htmt else "FALSE"
 
         r_code = f"""
-        suppressPackageStartupMessages(library(lavaan))
-
-        # 你需要先確保 measureQ 已安裝/可 library()
         suppressPackageStartupMessages(library(measureQ))
 
-        df <- read.csv("{data_csv.as_posix()}", check.names=FALSE)
+        Data <- read.csv("{data_csv.as_posix()}", check.names=FALSE)
         items <- c({",".join([f'"{x}"' for x in items])})
 
-        model <- '{cfa_model.replace("'", '"')}'
+        # (optional) ensure item columns exist
+        for (v in items) {{
+          if (! (v %in% names(Data))) stop(paste0("Missing item column: ", v))
+        }}
 
-        fit <- cfa(
-          model,
-          data=df,
-          estimator="MLR",
-          missing="ML",
-          se="bootstrap",
-          bootstrap={int(bootstrap)}
-        )
+        Model <- '{model_syntax.replace("'", '"')}'
 
-        # ---- 下面這段要依 measureQ 版本調整：輸出你要的表 ----
-        # 例：假設 measureQ 有一個主函數 measureQ(fit, ...) 回傳 list of tables
-        res <- measureQ(fit)
+        # capture console output
+        sink(file.path("{out_dir.as_posix()}", "measureQ_console.txt"))
+        res <- measureQ(Model, Data, b.no={int(b_no)}, HTMT="{htmt_arg}"{cluster_arg})
+        print(res)
+        sink()
 
-        # 假設 res$table1, res$table2...
-        write.csv(res$table1, file=file.path("{out_dir.as_posix()}", "measureQ_table1.csv"), row.names=FALSE)
-        write.csv(res$table2, file=file.path("{out_dir.as_posix()}", "measureQ_table2.csv"), row.names=FALSE)
+        # if res is a list, export any table-like elements
+        if (is.list(res)) {{
+          nms <- names(res)
+          if (!is.null(nms)) {{
+            for (nm in nms) {{
+              obj <- res[[nm]]
+              if (is.data.frame(obj) || is.matrix(obj)) {{
+                write.csv(as.data.frame(obj),
+                          file=file.path("{out_dir.as_posix()}", paste0("measureQ_", nm, ".csv")),
+                          row.names=FALSE)
+              }}
+            }}
+          }}
+        }}
         """
 
         r_file = td / "run_measureQ.R"
         r_file.write_text(r_code, encoding="utf-8")
+
         subprocess.run([rscript, str(r_file)], check=True)
 
-        out = {}
-        for nm in ["measureQ_table1.csv", "measureQ_table2.csv"]:
-            p = out_dir / nm
-            out[nm.replace(".csv","")] = pd.read_csv(p) if p.exists() else pd.DataFrame()
+        # read any exported CSV tables
+        tables: Dict[str, pd.DataFrame] = {}
+        for p in sorted(out_dir.glob("measureQ_*.csv")):
+            name = p.stem  # measureQ_xxx
+            tables[name] = pd.read_csv(p).round(dec)
+
+        # read console log as a "one-column table" so you can write it into Excel
+        log_path = out_dir / "measureQ_console.txt"
+        if log_path.exists():
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            log_df = pd.DataFrame({"measureQ_console": lines})
+        else:
+            log_df = pd.DataFrame()
+
+        out = {
+            "info": pd.DataFrame([{
+                "tool": "measureQ",
+                "b.no": int(b_no),
+                "HTMT": bool(htmt),
+                "cluster": cluster or "",
+                "decimals": int(dec),
+            }]),
+            "measureQ_log": log_df,
+        }
+        out.update(tables)
         return out
