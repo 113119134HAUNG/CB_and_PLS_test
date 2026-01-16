@@ -166,7 +166,9 @@ class PLSConfig:
     # ---- Model1 / Model2 control ----
     RUN_MODEL1: bool = True
     RUN_MODEL2: bool = True
-
+    RUN_FULL_COLLINEARITY_VIF: bool = True
+    FULL_VIF_THRESHOLD: float = 3.3
+    
     MODEL1_EDGES: List[Tuple[str, str]] = field(default_factory=lambda: [
         ("SA", "MIND"), ("SA", "ACO"), ("SA", "CCO"),
         ("PA", "BB"), ("PA", "BS"),
