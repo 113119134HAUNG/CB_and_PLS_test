@@ -204,14 +204,6 @@ def gpower_table_for_path_model(
 # =========================================================
 # helpers
 # =========================================================
-def _apply_sign_to_scores(scores_df: pd.DataFrame, sign_map: dict) -> pd.DataFrame:
-    out = scores_df.copy()
-    for lv, s in sign_map.items():
-        if lv in out.columns and int(s) == -1:
-            out[lv] = -out[lv]
-    return out
-
-
 def _bootstrap_paths_single_model(
     cog,
     *,
