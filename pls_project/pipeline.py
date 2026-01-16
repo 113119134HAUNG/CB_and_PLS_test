@@ -42,7 +42,10 @@ from pls_project.pls_bootstrap import summarize_direct_ci
 
 from pls_project.micom import micom_two_group, MICOMSettings
 
-from pls_project.cbsem_wlsmv import run_cbsem_esem_then_cfa_sem_wlsmv
+from pls_project.cbsem_wlsmv import (
+    run_cbsem_esem_then_cfa_sem_wlsmv,
+    run_cbsem_cfa_invariance_wlsmv,
+)
 from pls_project.measureq_mlr import run_measureq
 from pls_project.cmv_clf_mlr import run_cmv_clf_mlr
 
@@ -636,7 +639,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     CFA_Loadings, CFA_Info, CFA_Fit = run_cfa(cog, df_valid, groups, group_items, item_cols)
 
     # ==============================
-    # CB-SEM line 1: ESEM -> CFA/SEM (ordered/WLSMV)
+    # CB-SEM line 1: ESEM -> CFA/SEM (ordered/WLSMV) + MG-CFA invariance
     # ==============================
     CBSEM = {
         "info": pd.DataFrame(),
@@ -647,24 +650,39 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         "SEM_fit": pd.DataFrame(),
         "SEM_paths": pd.DataFrame(),
     }
+
+    CBSEM_INV = {
+        "info": pd.DataFrame(),
+        "INV_group_counts": pd.DataFrame(),
+        "INV_fit_long": pd.DataFrame(),
+        "INV_fit_delta": pd.DataFrame(),
+        "INV_pass": pd.DataFrame(),
+    }
+
     if bool(getattr(cfg.cfa, "RUN_CBSEM_WLSMV", False)):
         try:
-            df_cb = df_valid[item_cols].copy()
+            # NOTE:
+            # - CBSEM(ESEM/CFA/SEM) 只需要 items 欄
+            # - Invariance 需要 meta 欄（分組欄），所以這裡保留 df_valid 全欄，交由 invariance function 自動挑 group_var
+            df_cb_items = df_valid[item_cols].copy()
+            df_cb_all = df_valid.copy()
+
             nf = int(getattr(cfg.cfa, "ESEM_NFACTORS", 0))
             if nf <= 0:
                 nf = len(groups)
+
             rotation = str(getattr(cfg.cfa, "ESEM_ROTATION", "geomin"))
             missing = str(getattr(cfg.cfa, "CBSEM_MISSING", "listwise"))
 
             sem_edges = list(getattr(cfg.cfa, "SEM_EDGES", []))
             if not sem_edges:
-                sem_edges = list(getattr(cfg.pls, "MODEL1_EDGES", []))
+            sem_edges = list(getattr(cfg.pls, "MODEL1_EDGES", []))
             sem_edges = [(a, b) for (a, b) in sem_edges if (a in groups and b in groups)]
             run_sem = bool(getattr(cfg.cfa, "RUN_SEM_WLSMV", True))
 
             CBSEM = run_cbsem_esem_then_cfa_sem_wlsmv(
                 cog,
-                df_cb,
+                df_cb_items,
                 items=item_cols,
                 groups=groups,
                 group_items=group_items,
@@ -675,8 +693,32 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 sem_edges=sem_edges,
                 rscript=str(getattr(cfg.cfa, "RSCRIPT_BIN", "Rscript")),
             )
+
+            # ---- MG-CFA invariance (ordered/WLSMV) ----
+            RUN_INV = bool(getattr(cfg.cfa, "RUN_CBSEM_INVARIANCE", False))
+            if RUN_INV:
+                INV_GROUP_VAR = getattr(cfg.cfa, "INV_GROUP_VAR", None)  # None => auto-pick from meta
+                INV_NUM_RATIO_TH = float(getattr(cfg.cfa, "INV_NUMERIC_RATIO_TH", 0.80))
+                INV_MIN_N = int(getattr(cfg.cfa, "INV_MIN_N_PER_GROUP", 30))
+                INV_STRICT = bool(getattr(cfg.cfa, "INV_INCLUDE_STRICT", False))
+
+                CBSEM_INV = run_cbsem_cfa_invariance_wlsmv(
+                    cog,
+                    df_cb_all,                 # must include meta columns for auto grouping
+                    items=item_cols,
+                    groups=groups,
+                    group_items=group_items,
+                    group_var=INV_GROUP_VAR,   # or None for auto
+                    missing=missing,
+                    numeric_ratio_th=INV_NUM_RATIO_TH,
+                    min_n_per_group=INV_MIN_N,
+                    include_strict=INV_STRICT,
+                    rscript=str(getattr(cfg.cfa, "RSCRIPT_BIN", "Rscript")),
+                )
+
         except Exception as e:
             CBSEM = {"info": pd.DataFrame([{"Error": f"CBSEM_WLSMV failed: {e}"}])}
+            CBSEM_INV = {"info": pd.DataFrame([{"Error": f"CBSEM_INVARIANCE failed: {e}"}])}
 
     # ==============================
     # CB-SEM line 2: measureQ best-practice (MLR robustness)
