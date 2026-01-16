@@ -107,10 +107,15 @@ def resolve_schema(df: pd.DataFrame, cfg, cog=None):
 
     resolved: dict[str, str] = {}
 
-    first_col = _first_real_col(columns)
-    if not first_col:
-        raise ValueError("DataFrame has no usable columns.")
-    resolved["TS_COL"] = first_col
+    # 先用規則找 TS_COL
+    idx_ts = _match_meta(cols_norm, "TS_COL")
+    if idx_ts is not None:
+        resolved["TS_COL"] = columns[idx_ts]
+    else:
+        first_col = _first_real_col(columns)
+        if not first_col:
+            raise ValueError("DataFrame has no usable columns.")
+        resolved["TS_COL"] = first_col
 
     for k in ["USER_COL", "EMAIL_COL", "EXP_COL"]:
         idx = _match_meta(cols_norm, k)
