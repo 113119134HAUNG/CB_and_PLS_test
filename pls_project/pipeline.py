@@ -29,12 +29,13 @@ from pls_project.pls_core import (
     q2_cv_from_scores,
     structural_vif,
     ols_fit,
-    # bootstrap needs these:
     run_plspm_python,
     get_path_results,
     apply_sign_to_paths,
     get_sign_map_by_anchors,
+    apply_sign_to_scores, 
 )
+
 
 from pls_project.pls_estimate import estimate_pls_basic_paper
 from pls_project.pls_bootstrap import summarize_direct_ci
