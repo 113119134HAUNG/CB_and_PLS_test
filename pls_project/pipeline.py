@@ -38,6 +38,7 @@ from pls_project.pls_core import (
 
 from pls_project.pls_estimate import estimate_pls_basic_paper
 from pls_project.pls_bootstrap import summarize_direct_ci
+
 from pls_project.micom import micom_two_group, MICOMSettings
 
 from pls_project.cbsem_wlsmv import run_cbsem_esem_then_cfa_sem_wlsmv
@@ -54,14 +55,6 @@ def full_collinearity_vif(
     threshold: float = 3.3,
     decimals: int = 3,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Full collinearity VIF (CMV check) using LV scores:
-      For each construct y: regress y on all other constructs -> R2 -> VIF = 1/(1-R2)
-
-    Returns:
-      summary_df: Max VIF and pass/fail
-      detail_df: per-construct VIF
-    """
     if scores_df is None or scores_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -120,15 +113,6 @@ def gpower_required_n_multiple_regression(
     power: float,
     n_max: int = 20000,
 ) -> int:
-    """
-    G*Power-equivalent for Linear multiple regression (R^2 deviation from zero)
-    using Cohen's f^2 and noncentral F.
-
-    u = number of predictors
-    v = N - u - 1
-    lambda = f^2 * N
-    power = P(F > F_crit | ncf(u,v,lambda))
-    """
     u = int(u_predictors)
     if u < 1:
         raise ValueError("u_predictors must be >= 1")
@@ -175,9 +159,6 @@ def gpower_table_for_path_model(
     alpha: float,
     power: float,
 ) -> pd.DataFrame:
-    """
-    Conservative: use max number of predictors among endogenous equations.
-    """
     if path_df is None or path_df.empty:
         return pd.DataFrame([{"Info": "path_df empty; G*Power not applicable."}])
 
@@ -218,7 +199,6 @@ def gpower_table_for_path_model(
 # helpers
 # =========================================================
 def _apply_sign_to_scores(scores_df: pd.DataFrame, sign_map: dict) -> pd.DataFrame:
-    """Flip LV scores using sign_map (+1/-1)."""
     out = scores_df.copy()
     for lv, s in sign_map.items():
         if lv in out.columns and int(s) == -1:
@@ -433,7 +413,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
     if EXP_COL in df.columns and ("頻率" in str(EXP_COL)) and (EXP_COL_EXPER in df.columns):
         EXP_COL = EXP_COL_EXPER
 
-    # meta columns may be renamed (rare, but guard)
     if rename_map:
         TS_COL = rename_map.get(TS_COL, TS_COL)
         USER_COL = rename_map.get(USER_COL, USER_COL)
@@ -495,29 +474,22 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             return float(x) > 0
 
         s = str(x).strip()
-
         no_kw = ["沒有", "否", "不曾", "從未", "未", "無"]
         if any(k in s for k in no_kw):
             return False
-
         if re.search(r"\d", s) and any(u in s for u in ["小時", "天", "週", "月", "年"]):
             return True
-
         yes_kw = ["有", "是", "曾", "使用過"]
         if any(k in s for k in yes_kw):
             return True
-
         return False
 
-    # 1) No experience
     if FILTER_NOEXP and (EXP_COL in df.columns):
         df["_flag_noexp"] = ~df[EXP_COL].apply(has_experience)
 
-    # 2) Duplicate
     if FILTER_DUP:
         df["_ts"] = pd.to_datetime(df[TS_COL], errors="coerce") if TS_COL in df.columns else pd.NaT
         df["_orig_order"] = np.arange(len(df))
-
         dup_key = [c for c in [USER_COL, EMAIL_COL] if c in df.columns]
         if dup_key:
             df_sorted = df.sort_values(["_ts", "_orig_order"], na_position="last").copy()
@@ -534,7 +506,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         if c in df.columns:
             df[c] = df[c].apply(reverse_1to5).astype(float)
 
-    # 3) Careless
     if FILTER_CARELESS:
         k_all = len(item_cols)
         miss_rate = df[item_cols].isna().mean(axis=1)
@@ -607,22 +578,18 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         "SEM_fit": pd.DataFrame(),
         "SEM_paths": pd.DataFrame(),
     }
-
     if bool(getattr(cfg.cfa, "RUN_CBSEM_WLSMV", False)):
         try:
             df_cb = df_valid[item_cols].copy()
-
             nf = int(getattr(cfg.cfa, "ESEM_NFACTORS", 0))
             if nf <= 0:
                 nf = len(groups)
-
             rotation = str(getattr(cfg.cfa, "ESEM_ROTATION", "geomin"))
             missing = str(getattr(cfg.cfa, "CBSEM_MISSING", "listwise"))
 
             sem_edges = list(getattr(cfg.cfa, "SEM_EDGES", []))
             if not sem_edges:
                 sem_edges = list(getattr(cfg.pls, "MODEL1_EDGES", []))
-
             sem_edges = [(a, b) for (a, b) in sem_edges if (a in groups and b in groups)]
             run_sem = bool(getattr(cfg.cfa, "RUN_SEM_WLSMV", True))
 
@@ -683,7 +650,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         "DELTA_summary": pd.DataFrame(),
         "console_log": pd.DataFrame(),
     }
-
     if bool(getattr(cfg.cfa, "RUN_CMV_CLF_MLR", False)):
         try:
             CMV3 = run_cmv_clf_mlr(
@@ -703,20 +669,20 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         except Exception as e:
             CMV3 = {"info": pd.DataFrame([{"Error": f"CMV_CLF_MLR failed: {e}"}])}
 
-    # ==============================
-    # PLS main (estimation + bootstrap) with config controls
-    # ==============================
+    # =========================================================
+    # PLS + MICOM
+    # =========================================================
+    MICOM_out: dict[str, dict[str, pd.DataFrame]] = {}
+
     PLS1_info = PLS1_outer = PLS1_quality = PLS1_htmt = PLS1_cross = pd.DataFrame()
     PLS2_info = PLS2_outer = PLS2_quality = PLS2_htmt = PLS2_cross = PLS2_commitment = pd.DataFrame()
 
     PLS1_R2 = PLS1_f2 = PLS1_Q2 = PLS1_VIF = pd.DataFrame()
     PLS2_R2 = PLS2_f2 = PLS2_Q2 = PLS2_VIF = pd.DataFrame()
 
-    # CMV: full collinearity VIF
     PLS1_CMV_SUM = PLS1_VIF_FULL = pd.DataFrame()
     PLS2_CMV_SUM = PLS2_VIF_FULL = pd.DataFrame()
 
-    # G*Power
     PLS1_GPOWER = pd.DataFrame()
     PLS2_GPOWER = pd.DataFrame()
 
@@ -732,22 +698,28 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             if str(getattr(cfg.pls, "PLS_MISSING", "listwise")).lower() == "mean":
                 raise ValueError("CLEAN_MODE=True forbids PLS_MISSING='mean' (generates new values).")
 
-        Xpls = df_valid[item_cols].copy().astype(float)
-
+        # ---- build Xpls + aligned meta index ----
+        Xpls_raw = df_valid[item_cols].copy().astype(float)
         miss = str(getattr(cfg.pls, "PLS_MISSING", "listwise")).lower()
+
         if miss == "none":
-            if Xpls.isna().any().any():
+            if Xpls_raw.isna().any().any():
                 raise ValueError("PLS_MISSING='none' but missing values exist. Handle missing before import.")
+            idx_keep = Xpls_raw.index
+            Xpls = Xpls_raw.copy()
         elif miss == "listwise":
-            Xpls = Xpls.dropna()
+            idx_keep = Xpls_raw.dropna().index
+            Xpls = Xpls_raw.loc[idx_keep].copy()
         elif miss == "mean":
+            idx_keep = Xpls_raw.index
+            Xpls = Xpls_raw.copy()
             Xpls = Xpls.apply(lambda s: s.fillna(s.mean()), axis=0)
         else:
             raise ValueError(f"Unknown PLS_MISSING: {cfg.pls.PLS_MISSING}")
 
         Xpls = Xpls.reset_index(drop=True)
+        df_meta = df_valid.loc[idx_keep].reset_index(drop=True)
 
-        # controls
         RUN_FULL_VIF = bool(getattr(cfg.pls, "RUN_FULL_COLLINEARITY_VIF", True))
         FULL_VIF_TH = float(getattr(cfg.pls, "FULL_VIF_THRESHOLD", 3.3))
         DEC = int(getattr(cfg.pls, "PAPER_DECIMALS", 3))
@@ -761,8 +733,11 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
         RUN_M2 = bool(getattr(cfg.pls, "RUN_MODEL2", True))
 
         res1 = None
-        order1 = path1 = None
+        order1 = None
+        path1 = None
         scores1 = None
+        lv_blocks1 = None
+        lv_modes1 = None
 
         # --------------------------
         # Model1
@@ -813,7 +788,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 if RUN_FULL_VIF:
                     PLS1_CMV_SUM, PLS1_VIF_FULL = full_collinearity_vif(scores1[order1], threshold=FULL_VIF_TH, decimals=DEC)
 
-                # ✅ G*Power table (after model exists; uses path + N actual)
                 if RUN_GPOWER:
                     PLS1_GPOWER = gpower_table_for_path_model(
                         path_df=path1,
@@ -822,6 +796,80 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         alpha=GP_ALPHA,
                         power=GP_POWER,
                     )
+
+                # ==============================
+                # ✅ MICOM (before MGA)
+                # ==============================
+                RUN_MICOM = bool(getattr(cfg.mga, "RUN_MICOM", False))
+                if RUN_MICOM:
+                    split_vars = list(getattr(cfg.mga, "MICOM_SPLITS", getattr(cfg.mga, "MGA_SPLITS", [])))
+                    Bm = int(getattr(cfg.mga, "MICOM_BOOT", getattr(cfg.mga, "MGA_BOOT", 200)))
+                    alpha_m = float(getattr(cfg.mga, "MICOM_ALPHA", 0.05))
+                    min_n = int(getattr(cfg.mga, "MGA_MIN_N_PER_GROUP", 30))
+                    seed_m = int(getattr(cfg.pls, "PLS_SEED", 0))
+
+                    settings = MICOMSettings(
+                        B=Bm,
+                        seed=seed_m,
+                        alpha=alpha_m,
+                        min_n_per_group=min_n,
+                        standardized=True,
+                    )
+
+                    for sv in split_vars:
+                        sv = str(sv)
+
+                        # choose split source: LV scores first, then meta columns
+                        if (scores1 is not None) and (sv in scores1.columns):
+                            v = pd.to_numeric(scores1[sv], errors="coerce")
+                            src = "LV_score"
+                        elif sv in df_meta.columns:
+                            v = df_meta[sv]
+                            src = "meta"
+                        else:
+                            MICOM_out[sv] = {"info": pd.DataFrame([{"Error": f"Split var not found: {sv}"}])}
+                            continue
+
+                        # numeric -> median split
+                        if pd.api.types.is_numeric_dtype(pd.to_numeric(v, errors="coerce")):
+                            vv = pd.to_numeric(v, errors="coerce")
+                            thr = float(np.nanmedian(vv))
+                            gmask = (vv >= thr).fillna(False).to_numpy()
+                            X_use = Xpls
+                            note = f"{src}; median split @ {thr:.4f}"
+                        else:
+                            # categorical -> top2 levels only
+                            s = v.astype(str).fillna("NA")
+                            levels = s.value_counts().index.tolist()
+                            if len(levels) < 2:
+                                MICOM_out[sv] = {"info": pd.DataFrame([{"Error": f"Split var has <2 levels: {sv}"}])}
+                                continue
+                            top2 = levels[:2]
+                            keep = s.isin(top2).to_numpy()
+                            X_use = Xpls.loc[keep].reset_index(drop=True)
+                            s2 = s.loc[keep].reset_index(drop=True)
+                            gmask = (s2 == top2[0]).to_numpy()
+                            note = f"{src}; top2 levels {top2}"
+
+                        try:
+                            out = micom_two_group(
+                                cog,
+                                X_full=X_use,
+                                path_df=path1,
+                                lv_blocks=lv_blocks1,
+                                lv_modes=lv_modes1,
+                                order=order1,
+                                group_mask=gmask,
+                                anchors=res1.get("anchors", {}) if isinstance(res1, dict) else {},
+                                settings=settings,
+                            )
+                            out["info"] = pd.concat(
+                                [pd.DataFrame([{"split_var": sv, "split_note": note}]), out.get("info", pd.DataFrame())],
+                                ignore_index=True,
+                            )
+                            MICOM_out[sv] = out
+                        except Exception as e:
+                            MICOM_out[sv] = {"info": pd.DataFrame([{"Error": f"MICOM failed ({sv}): {e}"}])}
 
                 PLS1_info = pd.DataFrame([{
                     "Model": f"Model1 [{tag}]",
@@ -834,6 +882,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                     "B(bootstrap)": int(cfg.pls.PLS_BOOT),
                     "CMV_fullVIF_th": FULL_VIF_TH if RUN_FULL_VIF else "",
                     "GPower(f2,alpha,power)": f"{GP_F2},{GP_ALPHA},{GP_POWER}" if RUN_GPOWER else "",
+                    "MICOM": bool(getattr(cfg.mga, "RUN_MICOM", False)),
                     "estimates": "outer/path from plspm model API (strict)",
                 }])
 
@@ -891,7 +940,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         return (x in groups) or (x == commitment)
 
                     edges2 = [(a, b) for (a, b) in edges2_all if ok_node(a) and ok_node(b)]
-
                     nodes2 = sorted({x for e in edges2 for x in e if x != commitment}, key=lambda x: groups.index(x) if x in groups else 999)
                     if commitment not in nodes2:
                         nodes2.append(commitment)
@@ -959,7 +1007,6 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                         if RUN_FULL_VIF:
                             PLS2_CMV_SUM, PLS2_VIF_FULL = full_collinearity_vif(scores2[order2], threshold=FULL_VIF_TH, decimals=DEC)
 
-                        # ✅ G*Power table (Model2)
                         if RUN_GPOWER:
                             PLS2_GPOWER = gpower_table_for_path_model(
                                 path_df=path2,
@@ -1057,6 +1104,30 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             r = write_block(writer, cfg.io.PAPER_SHEET, ws, r, f"G. CFA fit indices [{tag}]", CFA_Fit, index=False)
         ws.freeze_panes = "A2"
 
+        # ---- MICOM (NEW) ----
+        if bool(getattr(cfg.mga, "RUN_MICOM", False)):
+            micom_sheet = str(getattr(cfg.io, "MICOM_SHEET", "MICOM"))
+            ws_micom = get_or_create_ws(writer, micom_sheet)
+            rr0 = 0
+
+            if not MICOM_out:
+                rr0 = write_block(
+                    writer, micom_sheet, ws_micom, rr0,
+                    f"MICOM [{tag}]",
+                    pd.DataFrame([{"Info": "MICOM enabled but no results (Model1 not run or failed)."}]),
+                    index=False,
+                )
+            else:
+                for sv, res in MICOM_out.items():
+                    rr0 = write_block(writer, micom_sheet, ws_micom, rr0, f"MICOM - {sv} - INFO [{tag}]", res.get("info", pd.DataFrame()), index=False)
+                    rr0 = write_block(writer, micom_sheet, ws_micom, rr0, f"MICOM - {sv} - Step1 Configural [{tag}]", res.get("step1_configural", pd.DataFrame()), index=False)
+                    rr0 = write_block(writer, micom_sheet, ws_micom, rr0, f"MICOM - {sv} - Step2 Compositional [{tag}]", res.get("step2_compositional", pd.DataFrame()), index=False)
+                    rr0 = write_block(writer, micom_sheet, ws_micom, rr0, f"MICOM - {sv} - Step3 Mean/Var [{tag}]", res.get("step3_means_vars", pd.DataFrame()), index=False)
+                    rr0 = write_block(writer, micom_sheet, ws_micom, rr0, f"MICOM - {sv} - Summary [{tag}]", res.get("summary", pd.DataFrame()), index=False)
+                    rr0 += 1
+
+            ws_micom.freeze_panes = "A2"
+
         # ---- CBSEM_WLSMV ----
         if bool(getattr(cfg.cfa, "RUN_CBSEM_WLSMV", False)):
             cb_sheet = str(getattr(cfg.io, "CBSEM_SHEET", "CBSEM_WLSMV"))
@@ -1082,7 +1153,7 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
                 rm = write_block(writer, mq_sheet, ws_mq, rm, f"{k} [{tag}]", MQ.get(k, pd.DataFrame()), index=False)
             ws_mq.freeze_panes = "A2"
 
-        # ---- CMV_CLF_MLR (3rd line) ----
+        # ---- CMV_CLF_MLR ----
         if bool(getattr(cfg.cfa, "RUN_CMV_CLF_MLR", False)):
             cmv_sheet = str(getattr(cfg.io, "CMV_CLF_SHEET", "CMV_CLF_MLR"))
             ws_cmv = get_or_create_ws(writer, cmv_sheet)
