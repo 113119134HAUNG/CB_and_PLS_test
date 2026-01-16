@@ -96,7 +96,7 @@ def run_cbsem_esem_then_cfa_sem_wlsmv(
         r_code = f"""
         suppressPackageStartupMessages(library(lavaan))
 
-        df <- read.csv("{data_csv.as_posix()}", check.names=FALSE)
+        df <- read.csv("{data_csv.as_posix()}", check.names=FALSE, fileEncoding="UTF-8-BOM")
         items <- c({",".join([f'"{x}"' for x in items])})
 
         # coerce to ordered factors (works for numeric 1..5 or strings)
