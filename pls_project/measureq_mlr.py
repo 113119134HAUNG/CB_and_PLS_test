@@ -89,7 +89,11 @@ def run_measureq(
         r_file = td / "run_measureQ.R"
         r_file.write_text(r_code, encoding="utf-8")
 
-        subprocess.run([rscript, str(r_file)], check=True)
+        proc = subprocess.run([rscript, str(r_file)], capture_output=True, text=True)
+        (out_dir / "r_stdout.txt").write_text(proc.stdout or "", encoding="utf-8", errors="replace")
+        (out_dir / "r_stderr.txt").write_text(proc.stderr or "", encoding="utf-8", errors="replace")
+        if proc.returncode != 0:
+            raise RuntimeError(f"R failed with code={proc.returncode}. See r_stderr.txt in {out_dir}")
 
         # read any exported CSV tables
         tables: Dict[str, pd.DataFrame] = {}
