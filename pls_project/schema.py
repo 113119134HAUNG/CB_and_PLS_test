@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import re
 import difflib
+from typing import Dict, Optional
+
+import numpy as np
 import pandas as pd
 
 from .rulebook import META_RULES, PROFILES
 from .io_utils import _norm_text
+
+
+_EMAIL_RX = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.I)
 
 
 def _norm_col(c: str) -> str:
@@ -112,33 +118,159 @@ def build_rename_map(
     return rename
 
 
+# ------------------------------
+# New: infer meta columns by VALUES (not fixed column names)
+# ------------------------------
+def _email_ratio(s: pd.Series) -> float:
+    x = s.dropna().astype(str).str.strip()
+    if len(x) == 0:
+        return 0.0
+    return float(x.apply(lambda v: bool(_EMAIL_RX.match(v))).mean())
+
+
+def _datetime_ratio(s: pd.Series) -> float:
+    dt = pd.to_datetime(s, errors="coerce")
+    return float(dt.notna().mean())
+
+
+def _binary_ratio_01(s: pd.Series) -> float:
+    x = pd.to_numeric(s, errors="coerce").dropna()
+    if len(x) == 0:
+        return 0.0
+    u = set(np.unique(x))
+    return 1.0 if u.issubset({0, 1}) else 0.0
+
+
+def _yesno_ratio(s: pd.Series) -> float:
+    x = s.dropna().astype(str).str.strip().str.lower()
+    if len(x) == 0:
+        return 0.0
+    yes = {"yes", "y", "true", "t", "1", "有", "是"}
+    no = {"no", "n", "false", "f", "0", "沒有", "否", "未"}
+    return float(x.apply(lambda v: (v in yes) or (v in no)).mean())
+
+
+def _exp_like_score(colname: str, s: pd.Series) -> float:
+    """
+    Experience-like scoring (content-first, name as tie-breaker).
+    Higher is more likely to be "experience/use_experience".
+    """
+    name = str(colname).lower()
+    name_kw = ("exp", "experience", "use", "usage", "ai", "tool", "freq", "frequency", "proficiency")
+    name_score = sum(k in name for k in name_kw)
+
+    # content signals
+    bin01 = _binary_ratio_01(s)
+    yn = _yesno_ratio(s)
+
+    x = pd.to_numeric(s, errors="coerce")
+    nonna = x.notna().sum()
+    if nonna > 0:
+        xnum = x.dropna().astype(float)
+        prop_zero = float(np.mean(np.isclose(xnum, 0.0))) if len(xnum) else 0.0
+        prop_pos = float(np.mean(xnum > 0.0)) if len(xnum) else 0.0
+        # experience-like if has some zeros and some positives
+        num_mix = 1.0 if (prop_zero >= 0.05 and prop_pos >= 0.20) else 0.0
+    else:
+        num_mix = 0.0
+
+    # weights: binary/yesno strongest, then numeric mix, then name hints
+    return 3.0 * max(bin01, yn) + 1.5 * num_mix + 0.5 * float(name_score)
+
+
+def infer_meta_by_values(df: pd.DataFrame) -> Dict[str, str]:
+    """
+    Infer meta columns without relying on fixed names.
+    Returns possibly empty dict with keys among: TS_COL, EMAIL_COL, EXP_COL, USER_COL
+    """
+    cols = list(map(str, df.columns))
+    out: Dict[str, str] = {}
+
+    # EMAIL_COL
+    best_email = (None, 0.0)
+    for c in cols:
+        r = _email_ratio(df[c])
+        if r > best_email[1]:
+            best_email = (c, r)
+    if best_email[0] is not None and best_email[1] >= 0.80:
+        out["EMAIL_COL"] = best_email[0]
+
+    # TS_COL
+    best_ts = (None, 0.0)
+    for c in cols:
+        r = _datetime_ratio(df[c])
+        if r > best_ts[1]:
+            best_ts = (c, r)
+    if best_ts[0] is not None and best_ts[1] >= 0.80:
+        out["TS_COL"] = best_ts[0]
+
+    # EXP_COL
+    best_exp = (None, -1.0)
+    for c in cols:
+        sc = _exp_like_score(c, df[c])
+        if sc > best_exp[1]:
+            best_exp = (c, sc)
+    # threshold: must have some signal; otherwise leave unset
+    if best_exp[0] is not None and best_exp[1] >= 2.5:
+        out["EXP_COL"] = best_exp[0]
+
+    # USER_COL (optional, conservative)
+    # Only infer if there's a non-email string column with moderate uniqueness.
+    email_col = out.get("EMAIL_COL")
+    best_user = (None, 0.0)
+    for c in cols:
+        if c == email_col:
+            continue
+        s = df[c]
+        if pd.api.types.is_numeric_dtype(s):
+            continue
+        x = s.dropna().astype(str).str.strip()
+        if len(x) < 10:
+            continue
+        if _email_ratio(x) >= 0.50:
+            continue
+        uniq_ratio = x.nunique() / max(1, len(x))
+        # prefer something like names: not constant, not purely unique ID
+        if 0.10 <= uniq_ratio <= 0.95:
+            score = 1.0 - abs(uniq_ratio - 0.60)  # peak around 0.6
+            if score > best_user[1]:
+                best_user = (c, score)
+    if best_user[0] is not None and best_user[1] >= 0.25:
+        out["USER_COL"] = best_user[0]
+
+    return out
+
+
 def resolve_schema(df: pd.DataFrame, cfg, cog=None):
     """
     resolved_cols, profile_name, scale_prefixes, rename_map = resolve_schema(df, cfg, cog)
+
+    New behavior:
+      - Do NOT force TS_COL fallback to first column
+      - Use name-based META_RULES first, then infer by values
+      - If still not found, leave key missing (pipeline will skip related features)
     """
     columns = [str(c) for c in df.columns]
     cols_norm = [_norm_col(c) for c in columns]
 
     resolved: dict[str, str] = {}
 
-    # ✅ TS_COL：先用規則找，找不到才 fallback 到第一個有效欄
-    idx_ts = _match_meta(cols_norm, "TS_COL")
-    if idx_ts is not None:
-        resolved["TS_COL"] = columns[idx_ts]
-    else:
-        first_col = _first_real_col(columns)
-        if not first_col:
-            raise ValueError("DataFrame has no usable columns.")
-        resolved["TS_COL"] = first_col
-
-    for k in ["USER_COL", "EMAIL_COL", "EXP_COL"]:
+    # 1) name/rule-based meta matching
+    for k in ["TS_COL", "USER_COL", "EMAIL_COL", "EXP_COL"]:
         idx = _match_meta(cols_norm, k)
         if idx is not None:
             resolved[k] = columns[idx]
 
+    # 2) profile detect
     profile_name, scale_prefixes, item_token_regex = detect_profile(columns)
 
-    # ✅ 排除 meta 欄避免被 rename
+    # 3) value-based inference (fill missing only)
+    inferred = infer_meta_by_values(df)
+    for k, v in inferred.items():
+        if k not in resolved and v in columns:
+            resolved[k] = v
+
+    # 4) build rename map (exclude inferred meta cols too)
     exclude = set(resolved.values())
     rename_map = build_rename_map(columns, item_token_regex, exclude_cols=exclude)
 
@@ -154,7 +286,7 @@ def resolve_schema(df: pd.DataFrame, cfg, cog=None):
         cog.profile_name = profile_name
         cog.scale_prefixes = list(scale_prefixes)
         if hasattr(cog, "log") and cog.log:
-            cog.log.info(f"schema profile={profile_name}, TS_COL={resolved.get('TS_COL','')}")
+            cog.log.info(f"schema profile={profile_name}")
             cog.log.info(f"resolved meta={resolved}")
             cog.log.info(f"rename_map items={len(rename_map)}")
 
