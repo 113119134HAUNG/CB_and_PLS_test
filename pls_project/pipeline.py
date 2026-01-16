@@ -35,6 +35,7 @@ from pls_project.pls_core import (
 
 from pls_project.pls_estimate import estimate_pls_basic_paper
 from pls_project.pls_bootstrap import summarize_direct_ci
+from pls_project.cmv_clf_mlr import run_cmv_clf_mlr
 
 from pls_project.cbsem_wlsmv import run_cbsem_esem_then_cfa_sem_wlsmv
 from pls_project.measureq_mlr import run_measureq
@@ -578,7 +579,33 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             )
         except Exception as e:
             MQ = {"info": pd.DataFrame([{"Error": f"measureQ failed: {e}"}]), "measureQ_log": pd.DataFrame()}
+    
+    # ==============================
+    # CB-SEM line 3: CMV robustness via CLF/ULMC-like model (MLR)
+    # ==============================
+    CMV3 = {"info": pd.DataFrame(), "BASE_fit": pd.DataFrame(), "CLF_fit": pd.DataFrame(), "DELTA_fit": pd.DataFrame(),
+            "BASE_loadings": pd.DataFrame(), "CLF_loadings_sub": pd.DataFrame(), "CLF_loadings_method": pd.DataFrame(),
+            "DELTA_loadings": pd.DataFrame(), "DELTA_summary": pd.DataFrame(), "console_log": pd.DataFrame()}
 
+    if bool(getattr(cfg.cfa, "RUN_CMV_CLF_MLR", False)):
+        try:
+            CMV3 = run_cmv_clf_mlr(
+                cog,
+                df_valid[item_cols].copy(),
+                items=item_cols,
+                groups=groups,
+                group_items=group_items,
+                estimator=str(getattr(cfg.cfa, "CLF_ESTIMATOR", "MLR")),
+                missing=str(getattr(cfg.cfa, "CLF_MISSING", "ML")),
+                method_name=str(getattr(cfg.cfa, "CLF_METHOD_NAME", "CMV")),
+                orthogonal=bool(getattr(cfg.cfa, "CLF_ORTHOGONAL", True)),
+                equal_loadings=bool(getattr(cfg.cfa, "CLF_EQUAL_LOADINGS", True)),
+                delta_loading_flag=float(getattr(cfg.cfa, "CLF_DELTA_LOADING_FLAG", 0.10)),
+                rscript=str(getattr(cfg.cfa, "RSCRIPT_BIN", "Rscript")),
+            )
+        except Exception as e:
+            CMV3 = {"info": pd.DataFrame([{"Error": f"CMV_CLF_MLR failed: {e}"}])}
+    
     # ==============================
     # PLS main (estimation + bootstrap) with config controls
     # ==============================
@@ -989,8 +1016,26 @@ def run_pipeline(cog, reverse_target: bool, tag: str):
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-CMV. Full collinearity VIF detail", PLS2_VIF_FULL, index=False)
 
             rp = write_block(writer, cfg.io.PLS_SHEET, ws_pls, rp, "M2-ZZ. Bootstrap DIRECT paths (t/CI/Sig)", PLS2_BOOTPATH, index=False)
-
             ws_pls.freeze_panes = "A2"
+        
+        # ==============================
+        # Extra sheet: CMV_CLF_MLR (3rd line)
+        # ==============================
+        if bool(getattr(cfg.cfa, "RUN_CMV_CLF_MLR", False)):
+            cmv_sheet = str(getattr(cfg.io, "CMV_CLF_SHEET", "CMV_CLF_MLR"))
+            ws_cmv = get_or_create_ws(writer, cmv_sheet)
+            rr = 0
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"CMV-CLF INFO [{tag}]", CMV3.get("info", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"A. Baseline fit [{tag}]", CMV3.get("BASE_fit", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"B. CLF fit [{tag}]", CMV3.get("CLF_fit", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"C. Fit delta (CLF-BASE) [{tag}]", CMV3.get("DELTA_fit", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"D. Baseline standardized loadings [{tag}]", CMV3.get("BASE_loadings", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"E. CLF substantive loadings [{tag}]", CMV3.get("CLF_loadings_sub", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"F. CLF method loadings [{tag}]", CMV3.get("CLF_loadings_method", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"G. Loading delta (CLF-BASE) [{tag}]", CMV3.get("DELTA_loadings", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"H. Delta summary [{tag}]", CMV3.get("DELTA_summary", pd.DataFrame()), index=False)
+            rr = write_block(writer, cmv_sheet, ws_cmv, rr, f"Z. Console log [{tag}]", CMV3.get("console_log", pd.DataFrame()), index=False)
+            ws_cmv.freeze_panes = "A2"
 
     df_valid.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
     print("✅ 已輸出：", OUT_XLSX)
